@@ -1449,7 +1449,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
 
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "RippleServerPanel/2.2"
+    server_version = "RippleServerPanel/2.3"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -1530,7 +1530,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 profiles = [public_profile(item) for item in settings["servers"]]
                 active = settings.get("active_server_id")
                 self._json({"ok": True, "data": {"servers": profiles, "active_server_id": active,
-                            "platform": sys.platform, "panel_version": "2.2.0"}})
+                            "platform": sys.platform, "panel_version": "2.3.0"}})
                 return
             if path == "/api/status":
                 profile = self._profile_from_query(query)

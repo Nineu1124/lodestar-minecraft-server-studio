@@ -30,6 +30,7 @@
         <button class="nav-item" data-view="mods"><span>◇</span>Mod 管理</button>
         <button class="nav-item" data-view="settings"><span>⚙</span>配置与启动</button>
         <button class="nav-item" data-view="players"><span>♙</span>玩家管理</button>
+        <button class="nav-item" data-view="rules"><span>◌</span>游戏规则</button>
         <button class="nav-item" data-view="backups"><span>◴</span>世界备份</button>
         <button class="nav-item" data-view="automation"><span>◎</span>自动化</button>
         <button class="nav-item" data-view="diagnostics"><span>⌁</span>运行诊断</button>
@@ -207,6 +208,60 @@
           </div>
         </section>
 
+        <section class="view" data-view-panel="rules">
+          <div class="view-heading rules-heading">
+            <div><span class="overline">实时生效</span><h2>游戏规则</h2><p>直接控制时间、天气、难度和常用世界规则。</p></div>
+          </div>
+
+          <div class="rules-board" id="rules-board">
+            <section class="rule-section rule-environment">
+              <header><span>01</span><h3>世界环境</h3></header>
+              <div class="rule-command-group">
+                <strong>时间</strong>
+                <div class="rule-buttons">
+                  <button type="button" data-server-command="time set day" data-success="已切换到白天">白天</button>
+                  <button type="button" data-server-command="time set noon" data-success="已切换到正午">正午</button>
+                  <button type="button" data-server-command="time set night" data-success="已切换到夜晚">夜晚</button>
+                  <button type="button" data-server-command="time set midnight" data-success="已切换到午夜">午夜</button>
+                </div>
+              </div>
+              <div class="rule-command-group">
+                <strong>天气</strong>
+                <div class="rule-buttons">
+                  <button type="button" data-server-command="weather clear" data-success="天气已设为晴朗">晴朗</button>
+                  <button type="button" data-server-command="weather rain" data-success="天气已设为下雨">下雨</button>
+                  <button type="button" data-server-command="weather thunder" data-success="天气已设为雷暴">雷暴</button>
+                </div>
+              </div>
+              <div class="rule-command-group">
+                <strong>难度</strong>
+                <div class="rule-buttons">
+                  <button type="button" data-server-command="difficulty peaceful" data-success="难度已设为和平">和平</button>
+                  <button type="button" data-server-command="difficulty easy" data-success="难度已设为简单">简单</button>
+                  <button type="button" data-server-command="difficulty normal" data-success="难度已设为普通">普通</button>
+                  <button type="button" data-server-command="difficulty hard" data-success="难度已设为困难">困难</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="rule-section rule-behaviour">
+              <header><span>02</span><h3>世界行为</h3></header>
+              <div class="game-rule-row"><strong>死亡保留物品</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule keepInventory true" data-success="死亡保留物品已开启">开启</button><button type="button" data-server-command="gamerule keepInventory false" data-success="死亡保留物品已关闭">关闭</button></div></div>
+              <div class="game-rule-row"><strong>生物破坏方块</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule mobGriefing true" data-success="生物破坏已开启">开启</button><button type="button" data-server-command="gamerule mobGriefing false" data-success="生物破坏已关闭">关闭</button></div></div>
+              <div class="game-rule-row"><strong>昼夜循环</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule doDaylightCycle true" data-success="昼夜循环已开启">开启</button><button type="button" data-server-command="gamerule doDaylightCycle false" data-success="昼夜循环已关闭">关闭</button></div></div>
+              <div class="game-rule-row"><strong>天气循环</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule doWeatherCycle true" data-success="天气循环已开启">开启</button><button type="button" data-server-command="gamerule doWeatherCycle false" data-success="天气循环已关闭">关闭</button></div></div>
+              <div class="game-rule-row"><strong>火焰蔓延</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule doFireTick true" data-success="火焰蔓延已开启">开启</button><button type="button" data-server-command="gamerule doFireTick false" data-success="火焰蔓延已关闭">关闭</button></div></div>
+              <div class="game-rule-row"><strong>一人入睡跳过夜晚</strong><div class="rule-buttons"><button type="button" data-server-command="gamerule playersSleepingPercentage 1" data-success="一名玩家即可跳过夜晚">开启</button><button type="button" data-server-command="gamerule playersSleepingPercentage 100" data-success="已恢复全员入睡规则">关闭</button></div></div>
+            </section>
+          </div>
+
+          <form class="broadcast-line" id="broadcast-form">
+            <div><span class="overline">服务器公告</span><h3>向所有在线玩家发送消息</h3></div>
+            <label><span>公告内容</span><input id="broadcast-message" maxlength="200" autocomplete="off" placeholder="服务器将在十分钟后重启"></label>
+            <button class="button primary" type="submit">发送公告</button>
+          </form>
+        </section>
+
         <section class="view" data-view-panel="backups">
           <div class="view-heading">
             <div><span class="overline">世界安全</span><h2>世界备份</h2><p>在线备份前会临时关闭自动保存、强制落盘，完成后恢复自动保存。</p></div>
@@ -276,13 +331,14 @@
         </section>
 
         <section class="view" data-view-panel="about">
-          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.2.0</span></div>
+          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.3.0</span></div>
           <div class="feature-grid">
             <article class="feature-card"><i>⌘</i><h3>多实例</h3><p>导入并切换不同服务端，自动识别常见加载器和启动文件。</p></article>
             <article class="feature-card"><i>›_</i><h3>网页控制台</h3><p>查看实时日志，发送任意 Minecraft 服务端指令。</p></article>
             <article class="feature-card"><i>◇</i><h3>可恢复 Mod 管理</h3><p>上传、启停和回收 Mod，不直接永久删除文件。</p></article>
             <article class="feature-card"><i>◴</i><h3>安全备份</h3><p>在线保存后压缩世界与关键玩家配置，并按数量轮换。</p></article>
             <article class="feature-card"><i>♙</i><h3>玩家权限</h3><p>白名单、OP、踢出与封禁操作集中处理。</p></article>
+            <article class="feature-card"><i>◌</i><h3>游戏规则</h3><p>实时调整时间、天气、难度与常用 gamerule。</p></article>
             <article class="feature-card"><i>◐</i><h3>暖色双主题</h3><p>浅色陶土与深色炭火主题，可跟随系统或手动切换。</p></article>
             <article class="feature-card"><i>◎</i><h3>自动化维护</h3><p>按间隔备份世界，在每天固定时间正常重启。</p></article>
             <article class="feature-card"><i>⌁</i><h3>运行诊断</h3><p>聚合 Java、崩溃报告和日志中的高信号错误。</p></article>

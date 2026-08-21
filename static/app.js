@@ -342,6 +342,40 @@ async function sendConsoleCommand(event) {
   }
 }
 
+async function runPresetCommand(button) {
+  const command = button.dataset.serverCommand;
+  if (!command || !state.activeId) return;
+  setBusy(button, true, "执行中…");
+  try {
+    await api("/api/command", { method: "POST", body: { server_id: state.activeId, command } });
+    state.logCleared = false;
+    toast(button.dataset.success || "命令已执行");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function sendBroadcast(event) {
+  event.preventDefault();
+  const input = $("#broadcast-message");
+  const message = input.value.trim().replace(/[\r\n]+/g, " ");
+  if (!message) return toast("请输入公告内容", "error");
+  const button = $("button[type='submit']", event.currentTarget);
+  setBusy(button, true, "发送中…");
+  try {
+    await api("/api/command", { method: "POST", body: { server_id: state.activeId, command: `say ${message}` } });
+    input.value = "";
+    state.logCleared = false;
+    toast("公告已发送");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function commandHistoryKey(event) {
   if (!["ArrowUp", "ArrowDown"].includes(event.key) || !state.commandHistory.length) return;
   event.preventDefault();
@@ -770,6 +804,11 @@ function bindEvents() {
   $("#log-clear").addEventListener("click", () => { state.logCleared = true; $("#console-output").textContent = "显示已清空；点击刷新可重新载入日志。"; });
   $("#command-form").addEventListener("submit", sendConsoleCommand);
   $("#command-input").addEventListener("keydown", commandHistoryKey);
+  $("#rules-board").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-server-command]");
+    if (button) runPresetCommand(button);
+  });
+  $("#broadcast-form").addEventListener("submit", sendBroadcast);
   $("#mod-search").addEventListener("input", renderMods);
   $("#mod-filter").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-mod-state]");
