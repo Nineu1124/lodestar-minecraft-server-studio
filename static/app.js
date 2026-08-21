@@ -230,7 +230,7 @@ function updateStatusUI(status) {
     heroStart.textContent = status.running ? "正常停服" : "启动";
   }
 
-  $("#hero-title").textContent = status.ready ? "世界已经上线，冒险继续发生。" : status.running ? "正在装载世界，请稍候。" : "服务器安静地停在这里。";
+  $("#hero-title").textContent = status.ready ? "服务器正在运行。" : status.running ? "服务器正在启动。" : "服务器当前已停止。";
   $("#hero-subtitle").textContent = status.ready
     ? `${status.motd || "Minecraft Server"} · ${status.managed ? "由面板托管" : "已接管外部控制台"}`
     : status.running ? "Java 进程已启动，等待 Minecraft 状态端口就绪。" : "可以调整启动配置、管理 Mod 或创建离线备份。";

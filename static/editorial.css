@@ -609,3 +609,227 @@ th { font-size: 12px; letter-spacing: .07em; }
   .quick-action { min-height: 90px; }
   .automation-index { font-size: 64px; }
 }
+
+/* v2.2.1 — quieter controls and a continuous hero transition. */
+.server-library {
+  gap: 18px;
+}
+
+.section-label {
+  display: flex;
+  align-items: baseline;
+  gap: 11px;
+  padding-right: 18px;
+  border-right: 1px solid var(--line);
+}
+
+.section-label > span {
+  display: block;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.server-add-button {
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.server-add-button:hover,
+.server-add-button:focus-visible {
+  border-bottom-color: currentColor;
+  outline: 0;
+}
+
+.server-list {
+  gap: 18px;
+}
+
+.server-entry {
+  width: auto;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  grid-template-columns: minmax(0, auto) auto;
+  gap: 11px;
+  background: transparent;
+}
+
+.server-entry + .server-entry {
+  padding-left: 18px;
+  border-left: 1px solid var(--line);
+}
+
+.server-entry:hover,
+.server-entry.active {
+  border-color: var(--line);
+  background: transparent;
+}
+
+.server-entry .server-icon {
+  display: none;
+}
+
+.server-entry strong {
+  font-family: var(--display-font);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -.02em;
+}
+
+.server-entry:not(.active) strong {
+  color: var(--muted);
+}
+
+.server-entry .mini-dot {
+  width: 6px;
+  height: 6px;
+}
+
+.server-entry .mini-dot.online {
+  box-shadow: none;
+}
+
+.hero-card {
+  position: relative;
+  display: block;
+  isolation: isolate;
+  background: transparent;
+  backdrop-filter: none;
+  overflow: hidden;
+}
+
+.hero-copy {
+  position: relative;
+  z-index: 2;
+  width: min(54%, 790px);
+  max-width: none;
+  padding: 92px 58px 92px 0;
+}
+
+.hero-art {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.hero-art img {
+  object-position: right center;
+}
+
+.hero-art::after {
+  background:
+    linear-gradient(90deg,
+      var(--bg) 0%,
+      var(--bg) 29%,
+      color-mix(in srgb, var(--bg) 96%, transparent) 36%,
+      color-mix(in srgb, var(--bg) 78%, transparent) 46%,
+      color-mix(in srgb, var(--bg) 38%, transparent) 58%,
+      transparent 72%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 28%, transparent) 0%,
+      transparent 22%,
+      transparent 78%,
+      color-mix(in srgb, var(--bg) 20%, transparent) 100%);
+  opacity: 1;
+}
+
+html[data-theme="dark"] .hero-art::after {
+  background:
+    linear-gradient(90deg,
+      var(--bg) 0%,
+      var(--bg) 31%,
+      color-mix(in srgb, var(--bg) 97%, transparent) 39%,
+      color-mix(in srgb, var(--bg) 82%, transparent) 50%,
+      color-mix(in srgb, var(--bg) 42%, transparent) 63%,
+      transparent 76%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 38%, transparent) 0%,
+      transparent 25%,
+      transparent 74%,
+      color-mix(in srgb, var(--bg) 34%, transparent) 100%);
+}
+
+.metric-grid,
+.dashboard-grid {
+  background: transparent;
+}
+
+.dashboard-grid {
+  margin-top: 78px;
+  border-bottom: 0;
+}
+
+.dashboard-grid > .panel-card:first-child {
+  padding-left: 0;
+}
+
+.dashboard-grid > .panel-card:last-child {
+  padding-right: 0;
+}
+
+@media (max-width: 900px) {
+  .hero-card {
+    min-height: 690px;
+  }
+
+  .hero-copy {
+    width: 100%;
+    max-width: 660px;
+    padding: 56px 26px;
+  }
+
+  .hero-art {
+    top: 220px;
+  }
+
+  .hero-art::after,
+  html[data-theme="dark"] .hero-art::after {
+    background: linear-gradient(180deg,
+      var(--bg) 0%,
+      color-mix(in srgb, var(--bg) 92%, transparent) 18%,
+      color-mix(in srgb, var(--bg) 38%, transparent) 46%,
+      transparent 72%);
+  }
+}
+
+@media (max-width: 780px) {
+  .section-label {
+    padding-right: 0;
+    border-right: 0;
+  }
+
+  .server-list {
+    gap: 0;
+  }
+
+  .server-entry {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .server-entry + .server-entry {
+    padding-left: 0;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .hero-card {
+    min-height: 620px;
+  }
+
+  .hero-copy {
+    padding: 44px 20px;
+  }
+}
