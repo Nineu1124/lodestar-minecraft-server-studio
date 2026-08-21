@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+tests/.tmp/
+
+# 本机实例、运行日志和临时数据
+data/*
+!data/settings.example.json
+
+# 上传/备份应保存在各 Minecraft 服务端目录，而不是项目仓库
+*.uploading

@@ -1,0 +1,22 @@
+[project]
+name = "ripple-server-panel"
+version = "2.0.0"
+description = "Local web control panel for multiple Minecraft modpack servers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ripple Server Panel contributors" }]
+keywords = ["minecraft", "server", "forge", "fabric", "paper", "web-panel"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Games/Entertainment",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/your-name/ripple-server-panel"
+Issues = "https://github.com/your-name/ripple-server-panel/issues"
+
