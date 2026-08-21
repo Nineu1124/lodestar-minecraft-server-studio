@@ -145,8 +145,7 @@ function renderServerList() {
     button.className = `server-entry ${server.id === state.activeId ? "active" : ""}`;
     button.dataset.serverId = server.id;
     const initial = (server.name || "M").trim().slice(0, 1).toUpperCase();
-    const loader = server.detected?.loader && server.detected.loader !== "unknown" ? server.detected.loader : "Minecraft";
-    button.innerHTML = `<span class="server-icon">${escapeHtml(initial)}</span><span><strong>${escapeHtml(server.name)}</strong><small>${escapeHtml(loader)} · ${escapeHtml(server.detected?.version || "未知版本")}</small></span><i class="mini-dot ${server.id === state.activeId && state.status?.running ? "online" : ""}"></i>`;
+    button.innerHTML = `<span class="server-icon">${escapeHtml(initial)}</span><span><strong>${escapeHtml(server.name)}</strong></span><i class="mini-dot ${server.id === state.activeId && state.status?.running ? "online" : ""}"></i>`;
     container.append(button);
   }
 }
@@ -251,7 +250,14 @@ function updateStatusUI(status) {
     ? "—" : `${Number(status.storage.free_gb).toFixed(1)} GB`;
   $("#metric-disk-used").textContent = status.storage?.used_percent === null || status.storage?.used_percent === undefined
     ? "等待读取" : `已使用 ${Number(status.storage.used_percent).toFixed(1)}%`;
-  $("#detail-launch").textContent = `${server.launch_mode === "auto" ? "自动" : server.launch_mode} · ${server.detected?.target || "未检测"}`;
+  const launchLabels = {
+    forge_args: "Forge / NeoForge 参数文件",
+    jar: "直接运行 JAR",
+    script: "启动脚本",
+  };
+  $("#detail-launch").textContent = server.launch_mode === "auto"
+    ? `自动检测 · ${String(status.loader || "Minecraft").toUpperCase()}`
+    : launchLabels[server.launch_mode] || server.launch_mode;
   $("#detail-memory").textContent = `${server.xms} – ${server.xmx}`;
   $("#detail-external").textContent = server.external_address || "未设置";
   $("#detail-frp").textContent = status.frp_running ? "frpc 正在运行" : "未发现 frpc";

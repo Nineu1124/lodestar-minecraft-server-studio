@@ -1,6 +1,6 @@
 [project]
 name = "ripple-server-panel"
-version = "2.1.0"
+version = "2.2.0"
 description = "Local web control panel for multiple Minecraft modpack servers"
 readme = "README.md"
 requires-python = ">=3.11"

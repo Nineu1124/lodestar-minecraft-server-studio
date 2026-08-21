@@ -122,7 +122,7 @@ RippleServerPanel/
 │  ├─ app.css                # 基础组件与响应式布局
 │  ├─ editorial.css          # 暖色编辑风格与深色主题
 │  └─ app.js                 # 前端状态和 API 调用
-│  └─ assets/                # 原创 PNG 品牌图与首页主视觉
+│  └─ assets/                # 原创 PNG 品牌图、首页主视觉与整站背景
 ├─ data/
 │  └─ settings.example.json  # 空白配置示例
 ├─ 启动面板.bat

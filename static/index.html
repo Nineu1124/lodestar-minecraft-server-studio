@@ -38,7 +38,7 @@
 
       <div class="sidebar-note">
         <i class="status-dot safe"></i>
-        <div><strong>仅限本机访问</strong><span>127.0.0.1 · 不要映射面板端口</span></div>
+        <div><strong>仅限本机访问</strong></div>
       </div>
     </aside>
 
@@ -97,10 +97,10 @@
             <article class="panel-card quick-card">
               <div class="card-heading"><div><span class="overline">常用操作</span><h3>一键管理世界</h3></div></div>
               <div class="quick-grid">
-                <button class="quick-action" data-action="save"><i>↧</i><span><strong>保存世界</strong><small>save-all flush</small></span></button>
-                <button class="quick-action" data-action="day"><i>☀</i><span><strong>切换白天</strong><small>time set day</small></span></button>
-                <button class="quick-action" data-action="clear_weather"><i>☁</i><span><strong>清除天气</strong><small>weather clear</small></span></button>
-                <button class="quick-action" data-action="keep_inventory_on"><i>♜</i><span><strong>死亡不掉落</strong><small>keepInventory true</small></span></button>
+                <button class="quick-action" data-action="save"><i>↧</i><span><strong>保存世界</strong></span></button>
+                <button class="quick-action" data-action="day"><i>☀</i><span><strong>切换白天</strong></span></button>
+                <button class="quick-action" data-action="clear_weather"><i>☁</i><span><strong>清除天气</strong></span></button>
+                <button class="quick-action" data-action="keep_inventory_on"><i>♜</i><span><strong>死亡不掉落</strong></span></button>
               </div>
             </article>
             <article class="panel-card details-card">
@@ -160,14 +160,14 @@
                 <label class="wide"><span>MOTD</span><input name="motd" maxlength="160"></label>
               </div>
               <div class="switch-grid">
-                <label class="switch-row"><span><strong>允许飞行</strong><small>模组飞行时建议开启</small></span><input name="allow-flight" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>正版验证</strong><small>online-mode</small></span><input name="online-mode" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>安全档案验证</strong><small>enforce-secure-profile</small></span><input name="enforce-secure-profile" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>启用白名单</strong><small>white-list</small></span><input name="white-list" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>强制白名单</strong><small>enforce-whitelist</small></span><input name="enforce-whitelist" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>允许 PvP</strong><small>pvp</small></span><input name="pvp" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>极限模式</strong><small>hardcore</small></span><input name="hardcore" type="checkbox"><i></i></label>
-                <label class="switch-row"><span><strong>命令方块</strong><small>enable-command-block</small></span><input name="enable-command-block" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>允许飞行</strong></span><input name="allow-flight" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>正版验证</strong></span><input name="online-mode" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>安全档案验证</strong></span><input name="enforce-secure-profile" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>启用白名单</strong></span><input name="white-list" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>强制白名单</strong></span><input name="enforce-whitelist" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>允许 PvP</strong></span><input name="pvp" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>极限模式</strong></span><input name="hardcore" type="checkbox"><i></i></label>
+                <label class="switch-row"><span><strong>命令方块</strong></span><input name="enable-command-block" type="checkbox"><i></i></label>
               </div>
             </form>
 
@@ -222,22 +222,22 @@
 
         <section class="view" data-view-panel="automation">
           <div class="view-heading editorial-heading">
-            <div><span class="overline">Set it, then play</span><h2>让维护工作自己发生。</h2><p>面板保持运行时，可以按间隔备份世界，也可以在每天固定时间正常重启服务器。</p></div>
+            <div><span class="overline">自动维护</span><h2>让维护工作自己发生。</h2><p>按间隔备份世界，在每天固定时间正常重启服务器。</p></div>
             <button class="button primary" id="automation-save">保存计划</button>
           </div>
           <form id="automation-form" class="automation-grid">
             <article class="automation-card">
               <div class="automation-index">01</div>
-              <div class="automation-copy"><span class="overline">World safety</span><h3>自动世界备份</h3><p>备份前自动落盘，完成后恢复保存；旧备份按实例的保留数量轮换。</p></div>
+              <div class="automation-copy"><span class="overline">世界安全</span><h3>自动世界备份</h3><p>备份前保存世界，完成后按数量轮换旧备份。</p></div>
               <label class="editorial-switch"><input type="checkbox" name="backup_schedule_enabled"><span></span><b>启用</b></label>
-              <label class="automation-field"><span>每隔多少小时</span><input type="number" name="backup_interval_hours" min="1" max="168" value="6"><small>允许 1–168 小时</small></label>
+              <label class="automation-field"><span>备份间隔（小时）</span><input type="number" name="backup_interval_hours" min="1" max="168" value="6"></label>
               <dl class="automation-status"><div><dt>上次自动备份</dt><dd id="automation-last-backup">尚未执行</dd></div><div><dt>下次预计</dt><dd id="automation-next-backup">计划未启用</dd></div></dl>
             </article>
             <article class="automation-card dark-card">
               <div class="automation-index">02</div>
-              <div class="automation-copy"><span class="overline">Fresh start</span><h3>每日正常重启</h3><p>在指定时间发送 stop，等待世界保存并完全停服，然后由面板重新启动。</p></div>
+              <div class="automation-copy"><span class="overline">定时重启</span><h3>每日正常重启</h3><p>保存并完全停服后，由面板重新启动。</p></div>
               <label class="editorial-switch"><input type="checkbox" name="restart_schedule_enabled"><span></span><b>启用</b></label>
-              <label class="automation-field"><span>每天重启时间</span><input type="time" name="restart_time" value="04:00"><small>使用这台电脑的本地时间</small></label>
+              <label class="automation-field"><span>每天重启时间</span><input type="time" name="restart_time" value="04:00"></label>
               <dl class="automation-status"><div><dt>上次计划日期</dt><dd id="automation-last-restart">尚未执行</dd></div><div><dt>下次预计</dt><dd id="automation-next-restart">计划未启用</dd></div></dl>
             </article>
           </form>
@@ -246,7 +246,7 @@
 
         <section class="view" data-view-panel="diagnostics">
           <div class="view-heading editorial-heading">
-            <div><span class="overline">Read the signals</span><h2>在崩溃变成谜题之前找到线索。</h2><p>汇总 Java、加载器、Mod、磁盘、退出状态以及日志里的高信号错误行。</p></div>
+            <div><span class="overline">运行诊断</span><h2>在崩溃变成谜题之前找到线索。</h2><p>查看 Java、Mod、磁盘、退出状态和日志错误。</p></div>
             <div class="heading-actions"><button class="button ghost" id="diagnostic-copy">复制摘要</button><button class="button primary" id="diagnostic-refresh">重新扫描</button></div>
           </div>
           <div class="diagnostic-metrics">
@@ -263,12 +263,12 @@
           </dl>
           <div class="diagnostic-layout">
             <article class="signal-panel">
-              <div class="card-heading"><div><span class="overline">Latest signals</span><h3>最近的警告与错误</h3></div><span class="count-badge" id="diagnostic-error-count">0</span></div>
+              <div class="card-heading"><div><span class="overline">日志信号</span><h3>最近的警告与错误</h3></div><span class="count-badge" id="diagnostic-error-count">0</span></div>
               <ol class="signal-list" id="diagnostic-errors"></ol>
               <div class="table-empty hidden" id="diagnostic-errors-empty">latest.log 中没有发现高信号错误行</div>
             </article>
             <article class="crash-panel">
-              <div class="card-heading"><div><span class="overline">Crash archive</span><h3>崩溃报告</h3></div></div>
+              <div class="card-heading"><div><span class="overline">崩溃记录</span><h3>崩溃报告</h3></div></div>
               <div class="crash-list" id="crash-list"></div>
               <div class="table-empty hidden" id="crash-empty">没有崩溃报告</div>
             </article>
@@ -276,7 +276,7 @@
         </section>
 
         <section class="view" data-view-panel="about">
-          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.1.0</span></div>
+          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.2.0</span></div>
           <div class="feature-grid">
             <article class="feature-card"><i>⌘</i><h3>多实例</h3><p>导入并切换不同服务端，自动识别常见加载器和启动文件。</p></article>
             <article class="feature-card"><i>›_</i><h3>网页控制台</h3><p>查看实时日志，发送任意 Minecraft 服务端指令。</p></article>
