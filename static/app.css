@@ -93,7 +93,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px 25px; }
 .brand-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 15px; background: var(--accent); box-shadow: 0 9px 22px color-mix(in srgb, var(--accent) 30%, transparent); }
-.brand-mark svg { width: 26px; fill: #fff8ef; }
 .brand strong { display: block; font-size: 19px; letter-spacing: -.3px; }
 .brand span { display: block; margin-top: -2px; color: var(--muted); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
 

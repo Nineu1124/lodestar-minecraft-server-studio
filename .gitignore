@@ -6,6 +6,8 @@ Thumbs.db
 .idea/
 .vscode/
 tests/.tmp/
+tests/.test-work/
+tests/pyprobe/
 
 # 本机实例、运行日志和临时数据
 data/*

@@ -7,13 +7,14 @@
   <meta name="theme-color" content="#c9653b">
   <title>Ripple Server Panel</title>
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/editorial.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M12 2c.6 3-1.8 4.7-3.2 6.8C7 11.4 7.9 14 10 15.1c-.2-2.1 1.1-3.5 2.5-5 0 2.2 2.8 3.4 2.8 6.2 0 1.2-.4 2.2-1.1 3 2.9-.9 4.8-3.3 4.8-6.5 0-4.5-3.2-8.1-7-10.8Z"/><path d="M8.5 18.1c0 2.1 1.6 3.9 3.7 3.9 2 0 3.5-1.5 3.5-3.5 0-.5-.1-1-.3-1.4-.8 1.4-2.1 2.2-3.7 2.2-1.1 0-2.2-.4-3.2-1.2Z"/></svg>
+          <img src="/assets/ripple-emblem.png" alt="">
         </div>
         <div><strong>Ripple</strong><span>Server Panel</span></div>
       </div>
@@ -30,6 +31,8 @@
         <button class="nav-item" data-view="settings"><span>⚙</span>配置与启动</button>
         <button class="nav-item" data-view="players"><span>♙</span>玩家管理</button>
         <button class="nav-item" data-view="backups"><span>◴</span>世界备份</button>
+        <button class="nav-item" data-view="automation"><span>◎</span>自动化</button>
+        <button class="nav-item" data-view="diagnostics"><span>⌁</span>运行诊断</button>
         <button class="nav-item" data-view="about"><span>?</span>项目说明</button>
       </nav>
 
@@ -78,14 +81,16 @@
                 <button class="button ghost" data-view-jump="console">打开控制台</button>
               </div>
             </div>
-            <div class="server-orb" aria-hidden="true"><span></span><i></i><b></b></div>
+            <figure class="hero-art" aria-hidden="true"><img src="/assets/server-world-hero.png" alt=""></figure>
           </div>
 
           <div class="metric-grid">
             <article class="metric-card"><span>在线玩家</span><strong id="metric-players">—</strong><small id="metric-player-names">暂无数据</small></article>
             <article class="metric-card"><span>内存占用</span><strong id="metric-memory">—</strong><small id="metric-pid">等待进程</small></article>
+            <article class="metric-card"><span>CPU 负载</span><strong id="metric-cpu">—</strong><small id="metric-uptime">等待采样</small></article>
             <article class="metric-card"><span>游戏版本</span><strong id="metric-version">—</strong><small id="metric-loader">等待检测</small></article>
             <article class="metric-card"><span>监听端口</span><strong id="metric-port">—</strong><small id="metric-address">本地地址</small></article>
+            <article class="metric-card"><span>磁盘可用</span><strong id="metric-disk">—</strong><small id="metric-disk-used">等待读取</small></article>
           </div>
 
           <div class="dashboard-grid">
@@ -215,8 +220,63 @@
           <div class="hint-strip"><strong>存储位置</strong><span>备份保存在服务端的 panel-backups 文件夹中；超过保留数量的旧备份会移入其中的 .trash。</span></div>
         </section>
 
+        <section class="view" data-view-panel="automation">
+          <div class="view-heading editorial-heading">
+            <div><span class="overline">Set it, then play</span><h2>让维护工作自己发生。</h2><p>面板保持运行时，可以按间隔备份世界，也可以在每天固定时间正常重启服务器。</p></div>
+            <button class="button primary" id="automation-save">保存计划</button>
+          </div>
+          <form id="automation-form" class="automation-grid">
+            <article class="automation-card">
+              <div class="automation-index">01</div>
+              <div class="automation-copy"><span class="overline">World safety</span><h3>自动世界备份</h3><p>备份前自动落盘，完成后恢复保存；旧备份按实例的保留数量轮换。</p></div>
+              <label class="editorial-switch"><input type="checkbox" name="backup_schedule_enabled"><span></span><b>启用</b></label>
+              <label class="automation-field"><span>每隔多少小时</span><input type="number" name="backup_interval_hours" min="1" max="168" value="6"><small>允许 1–168 小时</small></label>
+              <dl class="automation-status"><div><dt>上次自动备份</dt><dd id="automation-last-backup">尚未执行</dd></div><div><dt>下次预计</dt><dd id="automation-next-backup">计划未启用</dd></div></dl>
+            </article>
+            <article class="automation-card dark-card">
+              <div class="automation-index">02</div>
+              <div class="automation-copy"><span class="overline">Fresh start</span><h3>每日正常重启</h3><p>在指定时间发送 stop，等待世界保存并完全停服，然后由面板重新启动。</p></div>
+              <label class="editorial-switch"><input type="checkbox" name="restart_schedule_enabled"><span></span><b>启用</b></label>
+              <label class="automation-field"><span>每天重启时间</span><input type="time" name="restart_time" value="04:00"><small>使用这台电脑的本地时间</small></label>
+              <dl class="automation-status"><div><dt>上次计划日期</dt><dd id="automation-last-restart">尚未执行</dd></div><div><dt>下次预计</dt><dd id="automation-next-restart">计划未启用</dd></div></dl>
+            </article>
+          </form>
+          <div class="editorial-note"><strong>面板窗口需要保持运行</strong><p>自动计划由本地 Python 进程执行。关闭面板、电脑睡眠或关机期间不会运行，重新打开后会继续计算下一次计划。</p></div>
+        </section>
+
+        <section class="view" data-view-panel="diagnostics">
+          <div class="view-heading editorial-heading">
+            <div><span class="overline">Read the signals</span><h2>在崩溃变成谜题之前找到线索。</h2><p>汇总 Java、加载器、Mod、磁盘、退出状态以及日志里的高信号错误行。</p></div>
+            <div class="heading-actions"><button class="button ghost" id="diagnostic-copy">复制摘要</button><button class="button primary" id="diagnostic-refresh">重新扫描</button></div>
+          </div>
+          <div class="diagnostic-metrics">
+            <article><span>Java</span><strong id="diagnostic-java">—</strong></article>
+            <article><span>加载器</span><strong id="diagnostic-loader">—</strong></article>
+            <article><span>已启用 Mod</span><strong id="diagnostic-mods">—</strong></article>
+            <article><span>崩溃报告</span><strong id="diagnostic-crashes">—</strong></article>
+          </div>
+          <dl class="diagnostic-context">
+            <div><dt>磁盘空间</dt><dd id="diagnostic-disk">—</dd></div>
+            <div><dt>日志大小</dt><dd id="diagnostic-log-size">—</dd></div>
+            <div><dt>上次退出</dt><dd id="diagnostic-last-exit">本次面板启动后暂无记录</dd></div>
+            <div><dt>扫描时间</dt><dd id="diagnostic-generated">—</dd></div>
+          </dl>
+          <div class="diagnostic-layout">
+            <article class="signal-panel">
+              <div class="card-heading"><div><span class="overline">Latest signals</span><h3>最近的警告与错误</h3></div><span class="count-badge" id="diagnostic-error-count">0</span></div>
+              <ol class="signal-list" id="diagnostic-errors"></ol>
+              <div class="table-empty hidden" id="diagnostic-errors-empty">latest.log 中没有发现高信号错误行</div>
+            </article>
+            <article class="crash-panel">
+              <div class="card-heading"><div><span class="overline">Crash archive</span><h3>崩溃报告</h3></div></div>
+              <div class="crash-list" id="crash-list"></div>
+              <div class="table-empty hidden" id="crash-empty">没有崩溃报告</div>
+            </article>
+          </div>
+        </section>
+
         <section class="view" data-view-panel="about">
-          <div class="view-heading"><div><span class="overline">开源本地工具</span><h2>关于 Ripple Server Panel</h2><p>一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.0.0</span></div>
+          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.1.0</span></div>
           <div class="feature-grid">
             <article class="feature-card"><i>⌘</i><h3>多实例</h3><p>导入并切换不同服务端，自动识别常见加载器和启动文件。</p></article>
             <article class="feature-card"><i>›_</i><h3>网页控制台</h3><p>查看实时日志，发送任意 Minecraft 服务端指令。</p></article>
@@ -224,6 +284,8 @@
             <article class="feature-card"><i>◴</i><h3>安全备份</h3><p>在线保存后压缩世界与关键玩家配置，并按数量轮换。</p></article>
             <article class="feature-card"><i>♙</i><h3>玩家权限</h3><p>白名单、OP、踢出与封禁操作集中处理。</p></article>
             <article class="feature-card"><i>◐</i><h3>暖色双主题</h3><p>浅色陶土与深色炭火主题，可跟随系统或手动切换。</p></article>
+            <article class="feature-card"><i>◎</i><h3>自动化维护</h3><p>按间隔备份世界，在每天固定时间正常重启。</p></article>
+            <article class="feature-card"><i>⌁</i><h3>运行诊断</h3><p>聚合 Java、崩溃报告和日志中的高信号错误。</p></article>
           </div>
           <article class="panel-card security-copy"><h3>安全边界</h3><p>面板只监听 <code>127.0.0.1</code>，校验 Host 与 Origin，并限制可修改的配置路径。SakuraFRP 只映射 Minecraft 的游戏端口，切勿映射面板的 <code>8765</code> 端口。</p><p>这是管理工具，不会自动解决 Mod 依赖或兼容性；更换 Mod 前建议先创建世界备份。</p></article>
         </section>

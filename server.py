@@ -28,6 +28,7 @@ APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
 DATA_ROOT = APP_ROOT / "data"
 SETTINGS_PATH = DATA_ROOT / "settings.json"
+SCHEDULER_STATE_PATH = DATA_ROOT / "scheduler-state.json"
 HOST = os.environ.get("RIPPLE_PANEL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RIPPLE_PANEL_PORT", "8765"))
 MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -39,6 +40,10 @@ RUNTIME_LOCK = threading.RLock()
 RUNTIMES: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.RLock()
 JOBS: dict[str, dict[str, Any]] = {}
+METRICS_LOCK = threading.RLock()
+CPU_SAMPLES: dict[int, tuple[float, int]] = {}
+SCHEDULER_LOCK = threading.RLock()
+LAST_EXITS: dict[str, dict[str, Any]] = {}
 
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 ALLOWED_ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
@@ -127,6 +132,10 @@ def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "launch_target": profile.get("launch_target", ""),
         "external_address": profile.get("external_address", ""),
         "auto_backup_keep": int(profile.get("auto_backup_keep", 10)),
+        "backup_schedule_enabled": bool(profile.get("backup_schedule_enabled", False)),
+        "backup_interval_hours": int(profile.get("backup_interval_hours", 6)),
+        "restart_schedule_enabled": bool(profile.get("restart_schedule_enabled", False)),
+        "restart_time": str(profile.get("restart_time", "04:00")),
         "exists": root.is_dir(),
         "detected": detected,
     }
@@ -179,6 +188,10 @@ def register_server(payload: dict[str, Any]) -> dict[str, Any]:
         "launch_target": "",
         "external_address": str(payload.get("external_address") or "").strip()[:200],
         "auto_backup_keep": 10,
+        "backup_schedule_enabled": False,
+        "backup_interval_hours": 6,
+        "restart_schedule_enabled": False,
+        "restart_time": "04:00",
         "created_at": now_iso(),
     }
     settings["servers"].append(profile)
@@ -201,9 +214,16 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "launch_target",
         "external_address",
         "auto_backup_keep",
+        "backup_schedule_enabled",
+        "backup_interval_hours",
+        "restart_schedule_enabled",
+        "restart_time",
     }
     if set(updates) - allowed:
         raise ValueError("启动配置中包含不允许的字段")
+    for boolean_key in ("backup_schedule_enabled", "restart_schedule_enabled"):
+        if boolean_key in updates and not isinstance(updates[boolean_key], bool):
+            raise ValueError(f"{boolean_key} 必须是布尔值")
     settings = read_settings()
     for profile in settings["servers"]:
         if profile.get("id") != server_id:
@@ -222,6 +242,16 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
         if not 1 <= keep <= 100:
             raise ValueError("备份保留数量必须在 1–100 之间")
         merged["auto_backup_keep"] = keep
+        merged["backup_schedule_enabled"] = bool(merged.get("backup_schedule_enabled", False))
+        interval = int(merged.get("backup_interval_hours", 6))
+        if not 1 <= interval <= 168:
+            raise ValueError("自动备份间隔必须在 1–168 小时之间")
+        merged["backup_interval_hours"] = interval
+        merged["restart_schedule_enabled"] = bool(merged.get("restart_schedule_enabled", False))
+        restart_time = str(merged.get("restart_time", "04:00")).strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", restart_time):
+            raise ValueError("定时重启时间必须是 HH:MM 格式")
+        merged["restart_time"] = restart_time
         profile.clear()
         profile.update(merged)
         write_settings(settings)
@@ -442,6 +472,14 @@ class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
     ]
 
 
+class FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+
+def filetime_ticks(value: FILETIME) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
 def windows_process_snapshot() -> dict[int, str]:
     if os.name != "nt":
         return {}
@@ -484,25 +522,48 @@ def process_info(pid: int | None) -> dict[str, Any] | None:
             memory = round(int(match.group(1)) / 1024, 1) if match else None
             name_match = re.search(r"^Name:\s+(.+)", text, re.M)
             name = name_match.group(1) if name_match else name
-        return {"pid": pid, "name": name, "memory_mb": memory}
+        return {"pid": pid, "name": name, "memory_mb": memory, "cpu_percent": None, "uptime_seconds": None}
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     psapi = ctypes.WinDLL("psapi", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
     psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), ctypes.c_uint32]
     psapi.GetProcessMemoryInfo.restype = ctypes.c_int
     process = kernel32.OpenProcess(0x0410, 0, pid)
     if not process:
-        return {"pid": pid, "name": "java.exe", "memory_mb": None}
+        return {"pid": pid, "name": "java.exe", "memory_mb": None, "cpu_percent": None, "uptime_seconds": None}
     try:
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
         memory = None
         if psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb):
             memory = round(counters.WorkingSetSize / 1024 / 1024, 1)
-        return {"pid": pid, "name": "java.exe", "memory_mb": memory}
+        creation = FILETIME()
+        exit_time = FILETIME()
+        kernel_time = FILETIME()
+        user_time = FILETIME()
+        cpu_percent = None
+        uptime_seconds = None
+        if kernel32.GetProcessTimes(process, ctypes.byref(creation), ctypes.byref(exit_time),
+                                    ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            process_ticks = filetime_ticks(kernel_time) + filetime_ticks(user_time)
+            wall_now = time.perf_counter()
+            with METRICS_LOCK:
+                previous = CPU_SAMPLES.get(pid)
+                CPU_SAMPLES[pid] = (wall_now, process_ticks)
+            if previous and wall_now > previous[0]:
+                used_seconds = (process_ticks - previous[1]) / 10_000_000
+                cpu_percent = round(max(0.0, min(100.0, used_seconds / (wall_now - previous[0]) /
+                                                       max(1, os.cpu_count() or 1) * 100)), 1)
+            created_unix = filetime_ticks(creation) / 10_000_000 - 11_644_473_600
+            uptime_seconds = max(0, int(time.time() - created_unix))
+        return {"pid": pid, "name": "java.exe", "memory_mb": memory,
+                "cpu_percent": cpu_percent, "uptime_seconds": uptime_seconds}
     finally:
         kernel32.CloseHandle(process)
 
@@ -573,7 +634,9 @@ def runtime_for(server_id: str) -> dict[str, Any] | None:
         runtime = RUNTIMES.get(server_id)
         if not runtime:
             return None
-        if runtime["process"].poll() is not None:
+        return_code = runtime["process"].poll()
+        if return_code is not None:
+            LAST_EXITS[server_id] = {"code": return_code, "at": now_iso()}
             try:
                 runtime["log"].close()
             except OSError:
@@ -594,6 +657,15 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
     players = (ping or {}).get("players", {})
     version = (ping or {}).get("version", {})
     detected = detect_launch(root)
+    try:
+        disk = shutil.disk_usage(root)
+        storage = {
+            "free_gb": round(disk.free / 1024 / 1024 / 1024, 1),
+            "total_gb": round(disk.total / 1024 / 1024 / 1024, 1),
+            "used_percent": round((disk.used / disk.total * 100) if disk.total else 0, 1),
+        }
+    except OSError:
+        storage = {"free_gb": None, "total_gb": None, "used_percent": None}
     return {
         "running": running,
         "ready": ping is not None,
@@ -611,6 +683,8 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
         "external_address": profile.get("external_address", ""),
         "managed": runtime is not None,
         "eula": eula_accepted(root),
+        "storage": storage,
+        "last_exit": LAST_EXITS.get(profile["id"]),
     }
 
 
@@ -1103,6 +1177,12 @@ def create_backup_worker(profile: dict[str, Any], job_id: str) -> None:
             trash.mkdir(exist_ok=True)
             shutil.move(str(old), str(unique_destination(trash, old.name)))
         set_job(job_id, state="done", progress=100, message=f"备份完成：{destination.name}")
+        with JOBS_LOCK:
+            scheduled = bool(JOBS.get(job_id, {}).get("scheduled"))
+        if scheduled:
+            scheduler_state = read_scheduler_state()
+            scheduler_state[f"backup_success:{profile['id']}"] = now_iso()
+            write_scheduler_state(scheduler_state)
     except Exception as exc:
         set_job(job_id, state="error", message=str(exc))
     finally:
@@ -1113,14 +1193,14 @@ def create_backup_worker(profile: dict[str, Any], job_id: str) -> None:
                 pass
 
 
-def start_backup(profile: dict[str, Any]) -> dict[str, Any]:
+def start_backup(profile: dict[str, Any], scheduled: bool = False) -> dict[str, Any]:
     with JOBS_LOCK:
         existing = next((job for job in JOBS.values() if job.get("server_id") == profile["id"] and job.get("state") in {"queued", "running"}), None)
         if existing:
             raise ValueError("该服务端已经有备份任务正在进行")
         job_id = uuid.uuid4().hex[:12]
         job = {"id": job_id, "server_id": profile["id"], "type": "backup", "state": "queued",
-               "progress": 0, "message": "备份任务已排队", "created_at": now_iso()}
+               "progress": 0, "message": "备份任务已排队", "created_at": now_iso(), "scheduled": scheduled}
         JOBS[job_id] = job
     threading.Thread(target=create_backup_worker, args=(profile.copy(), job_id), daemon=True).start()
     return job
@@ -1135,6 +1215,196 @@ def remove_backup(profile: dict[str, Any], name: str) -> str:
     trash = backup_folder(profile) / ".trash"
     shutil.move(str(source), str(unique_destination(trash, source.name)))
     return "备份已移入回收站"
+
+
+def read_scheduler_state() -> dict[str, Any]:
+    with SCHEDULER_LOCK:
+        try:
+            value = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+
+def write_scheduler_state(value: dict[str, Any]) -> None:
+    with SCHEDULER_LOCK:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary = SCHEDULER_STATE_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, SCHEDULER_STATE_PATH)
+
+
+def parse_iso(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    except (TypeError, ValueError):
+        return None
+
+
+def next_daily_time(time_text: str) -> dt.datetime:
+    now = dt.datetime.now().astimezone()
+    hour, minute = (int(part) for part in time_text.split(":"))
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return candidate if candidate > now else candidate + dt.timedelta(days=1)
+
+
+def automation_data(profile: dict[str, Any]) -> dict[str, Any]:
+    state = read_scheduler_state()
+    server_id = profile["id"]
+    anchor = parse_iso(state.get(f"backup_anchor:{server_id}") or state.get(f"backup:{server_id}"))
+    last_backup = parse_iso(state.get(f"backup_success:{server_id}"))
+    interval = int(profile.get("backup_interval_hours", 6))
+    next_backup = anchor + dt.timedelta(hours=interval) if anchor else dt.datetime.now().astimezone() + dt.timedelta(hours=interval)
+    return {
+        "backup_schedule_enabled": bool(profile.get("backup_schedule_enabled", False)),
+        "backup_interval_hours": interval,
+        "restart_schedule_enabled": bool(profile.get("restart_schedule_enabled", False)),
+        "restart_time": str(profile.get("restart_time", "04:00")),
+        "last_backup": last_backup.isoformat(timespec="seconds") if last_backup else None,
+        "next_backup": next_backup.isoformat(timespec="seconds") if profile.get("backup_schedule_enabled", False) else None,
+        "last_restart_date": state.get(f"restart:{server_id}"),
+        "next_restart": next_daily_time(str(profile.get("restart_time", "04:00"))).isoformat(timespec="seconds")
+        if profile.get("restart_schedule_enabled", False) else None,
+        "panel_must_stay_open": True,
+    }
+
+
+def configure_automation(payload: dict[str, Any]) -> dict[str, Any]:
+    values = payload.get("automation")
+    if not isinstance(values, dict):
+        raise ValueError("自动化配置格式不正确")
+    required = {"backup_schedule_enabled", "backup_interval_hours", "restart_schedule_enabled", "restart_time"}
+    if set(values) != required:
+        raise ValueError("自动化配置字段不完整")
+    if not isinstance(values["backup_schedule_enabled"], bool) or not isinstance(values["restart_schedule_enabled"], bool):
+        raise ValueError("自动化开关格式不正确")
+    previous = get_profile(str(payload.get("server_id", "")))
+    backup_just_enabled = values["backup_schedule_enabled"] and not previous.get("backup_schedule_enabled", False)
+    profile = update_profile({"server_id": payload.get("server_id"), "profile": values})
+    scheduler_state = read_scheduler_state()
+    key = f"backup_anchor:{profile['id']}"
+    if backup_just_enabled or (values["backup_schedule_enabled"] and key not in scheduler_state):
+        scheduler_state[key] = now_iso()
+        write_scheduler_state(scheduler_state)
+    return automation_data(profile)
+
+
+def scheduled_restart_worker(profile: dict[str, Any], job_id: str) -> None:
+    try:
+        set_job(job_id, state="running", message="正在按计划正常重启服务器…")
+        message = restart_server(profile)
+        set_job(job_id, state="done", progress=100, message=message)
+    except Exception as exc:
+        set_job(job_id, state="error", message=str(exc))
+
+
+def start_scheduled_restart(profile: dict[str, Any]) -> None:
+    with JOBS_LOCK:
+        job_id = uuid.uuid4().hex[:12]
+        JOBS[job_id] = {"id": job_id, "server_id": profile["id"], "type": "scheduled_restart",
+                        "state": "queued", "progress": 0, "message": "定时重启已触发", "created_at": now_iso()}
+    threading.Thread(target=scheduled_restart_worker, args=(profile.copy(), job_id), daemon=True).start()
+
+
+def scheduler_tick() -> None:
+    settings = read_settings()
+    scheduler_state = read_scheduler_state()
+    now = dt.datetime.now().astimezone()
+    changed = False
+    for profile in settings.get("servers", []):
+        server_id = profile.get("id")
+        if not server_id or not Path(profile.get("path", "")).is_dir():
+            continue
+        if profile.get("backup_schedule_enabled", False):
+            key = f"backup_anchor:{server_id}"
+            last = parse_iso(scheduler_state.get(key) or scheduler_state.get(f"backup:{server_id}"))
+            interval = dt.timedelta(hours=int(profile.get("backup_interval_hours", 6)))
+            if last is None:
+                scheduler_state[key] = now_iso()
+                changed = True
+            elif now - last >= interval:
+                try:
+                    start_backup(profile, scheduled=True)
+                    scheduler_state[key] = now_iso()
+                    changed = True
+                except ValueError:
+                    pass
+        if profile.get("restart_schedule_enabled", False):
+            key = f"restart:{server_id}"
+            if now.strftime("%H:%M") == str(profile.get("restart_time", "04:00")) and scheduler_state.get(key) != now.date().isoformat():
+                if server_is_running(profile)["running"]:
+                    start_scheduled_restart(profile)
+                scheduler_state[key] = now.date().isoformat()
+                changed = True
+    if changed:
+        write_scheduler_state(scheduler_state)
+
+
+def scheduler_loop() -> None:
+    while True:
+        try:
+            scheduler_tick()
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def java_version_text(profile: dict[str, Any]) -> str:
+    try:
+        completed = subprocess.run([java_executable(profile), "-version"], capture_output=True, text=True,
+                                   errors="replace", timeout=8,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        output = (completed.stderr or completed.stdout).strip().splitlines()
+        return output[0].strip() if output else "无法读取"
+    except (OSError, subprocess.SubprocessError):
+        return "无法读取"
+
+
+def diagnostic_data(profile: dict[str, Any]) -> dict[str, Any]:
+    root = Path(profile["path"])
+    crash_folder = root / "crash-reports"
+    crash_reports: list[dict[str, Any]] = []
+    if crash_folder.is_dir():
+        for path in sorted(crash_folder.glob("*.txt"), key=lambda item: item.stat().st_mtime, reverse=True)[:30]:
+            crash_reports.append({
+                "name": path.name,
+                "size_kb": round(path.stat().st_size / 1024, 1),
+                "modified": dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+            })
+    log_path = root / "logs" / "latest.log"
+    log_text = read_tail(log_path, 900_000)
+    signal = re.compile(r"(?:\bWARN\b|\bERROR\b|\bFATAL\b|Exception|Caused by:|mismatch|failed to|crash)", re.I)
+    error_lines = []
+    for line in log_text.splitlines():
+        cleaned = re.sub(r"§.", "", line).strip()
+        if cleaned and signal.search(cleaned):
+            error_lines.append(cleaned[-1200:])
+    detected = detect_launch(root)
+    mods = list_mods(profile)
+    status = server_is_running(profile)
+    return {
+        "java_version": java_version_text(profile),
+        "loader": detected.get("loader", "unknown"),
+        "game_version": status.get("version"),
+        "mod_count": sum(1 for item in mods if item["state"] == "enabled"),
+        "disabled_mod_count": sum(1 for item in mods if item["state"] == "disabled"),
+        "crash_reports": crash_reports,
+        "error_lines": error_lines[-80:],
+        "latest_log_size_mb": round(log_path.stat().st_size / 1024 / 1024, 2) if log_path.exists() else 0,
+        "last_exit": status.get("last_exit"),
+        "storage": status.get("storage"),
+        "generated_at": now_iso(),
+    }
+
+
+def crash_report_path(profile: dict[str, Any], name: str) -> Path:
+    if Path(name).name != name or not SAFE_FILE.fullmatch(name) or not name.lower().endswith(".txt"):
+        raise ValueError("崩溃报告文件名无效")
+    path = Path(profile["path"]) / "crash-reports" / name
+    if not path.is_file():
+        raise FileNotFoundError("找不到崩溃报告")
+    return path
 
 
 def pick_server_folder() -> str:
@@ -1179,7 +1449,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
 
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "RippleServerPanel/2.0"
+    server_version = "RippleServerPanel/2.1"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -1260,7 +1530,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 profiles = [public_profile(item) for item in settings["servers"]]
                 active = settings.get("active_server_id")
                 self._json({"ok": True, "data": {"servers": profiles, "active_server_id": active,
-                            "platform": sys.platform, "panel_version": "2.0.0"}})
+                            "platform": sys.platform, "panel_version": "2.1.0"}})
                 return
             if path == "/api/status":
                 profile = self._profile_from_query(query)
@@ -1291,6 +1561,18 @@ class PanelHandler(BaseHTTPRequestHandler):
                 with JOBS_LOCK:
                     jobs = list(JOBS.values())[-20:]
                 self._json({"ok": True, "data": jobs})
+                return
+            if path == "/api/automation":
+                self._json({"ok": True, "data": automation_data(self._profile_from_query(query))})
+                return
+            if path == "/api/diagnostics":
+                self._json({"ok": True, "data": diagnostic_data(self._profile_from_query(query))})
+                return
+            if path == "/api/crash-report/download":
+                profile = self._profile_from_query(query)
+                name = (query.get("name") or [""])[0]
+                file_path = crash_report_path(profile, name)
+                self._send_file(file_path, "text/plain; charset=utf-8", name)
                 return
             if path == "/api/backup/download":
                 profile = self._profile_from_query(query)
@@ -1395,6 +1677,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                         result = {"message": remove_backup(profile, str(payload.get("name", "")))}
                     else:
                         raise ValueError("未知备份操作")
+                elif path == "/api/automation":
+                    result = {"message": "自动化计划已保存", "data": configure_automation(payload)}
                 else:
                     self._json({"ok": False, "error": "接口不存在"}, HTTPStatus.NOT_FOUND)
                     return
@@ -1428,6 +1712,7 @@ def main() -> None:
             print(f"面板已经在运行：http://{HOST}:{PORT}")
             return
         raise
+    threading.Thread(target=scheduler_loop, daemon=True, name="ripple-scheduler").start()
     if not args.no_browser:
         threading.Timer(0.7, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
     print(f"Ripple Server Panel 已启动：http://{HOST}:{PORT}")

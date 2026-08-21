@@ -10,6 +10,7 @@ const state = {
   commandHistory: [],
   commandIndex: 0,
   logCleared: false,
+  diagnostics: null,
   timers: [],
 };
 
@@ -32,6 +33,17 @@ function formatDate(value) {
   if (!value) return "—";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "等待采样";
+  const total = Math.max(0, Math.floor(Number(seconds)));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days) return `已运行 ${days} 天 ${hours} 小时`;
+  if (hours) return `已运行 ${hours} 小时 ${minutes} 分`;
+  return `已运行 ${minutes} 分钟`;
 }
 
 function activeServer() {
@@ -92,7 +104,7 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("ripple-theme", theme);
   const meta = $('meta[name="theme-color"]');
-  if (meta) meta.content = theme === "dark" ? "#241d1a" : "#c9653b";
+  if (meta) meta.content = theme === "dark" ? "#191917" : "#f6f4ee";
 }
 
 function initializeTheme() {
@@ -121,6 +133,8 @@ function showView(view) {
   if (view === "settings") refreshSettings();
   if (view === "players") refreshPlayers();
   if (view === "backups") { refreshBackups(); refreshJobs(); }
+  if (view === "automation") refreshAutomation();
+  if (view === "diagnostics") refreshDiagnostics();
 }
 
 function renderServerList() {
@@ -170,6 +184,8 @@ async function refreshCurrentView() {
   if (state.view === "settings") return refreshSettings();
   if (state.view === "players") return refreshPlayers();
   if (state.view === "backups") return Promise.all([refreshBackups(), refreshJobs()]);
+  if (state.view === "automation") return refreshAutomation();
+  if (state.view === "diagnostics") return refreshDiagnostics();
 }
 
 async function selectServer(serverId) {
@@ -215,7 +231,7 @@ function updateStatusUI(status) {
     heroStart.textContent = status.running ? "正常停服" : "启动";
   }
 
-  $("#hero-title").textContent = status.ready ? `${server.name} 正在运行` : status.running ? "服务端正在加载世界" : `${server.name} 已停止`;
+  $("#hero-title").textContent = status.ready ? "世界已经上线，冒险继续发生。" : status.running ? "正在装载世界，请稍候。" : "服务器安静地停在这里。";
   $("#hero-subtitle").textContent = status.ready
     ? `${status.motd || "Minecraft Server"} · ${status.managed ? "由面板托管" : "已接管外部控制台"}`
     : status.running ? "Java 进程已启动，等待 Minecraft 状态端口就绪。" : "可以调整启动配置、管理 Mod 或创建离线备份。";
@@ -224,10 +240,17 @@ function updateStatusUI(status) {
   $("#metric-player-names").textContent = status.players?.names?.length ? status.players.names.join("、") : "暂无在线玩家";
   $("#metric-memory").textContent = formatBytesMB(status.process?.memory_mb);
   $("#metric-pid").textContent = status.process?.pid ? `PID ${status.process.pid}` : "等待 Java 进程";
+  $("#metric-cpu").textContent = status.process?.cpu_percent === null || status.process?.cpu_percent === undefined
+    ? "—" : `${Number(status.process.cpu_percent).toFixed(1)}%`;
+  $("#metric-uptime").textContent = status.running ? formatDuration(status.process?.uptime_seconds) : "服务端未运行";
   $("#metric-version").textContent = status.version || "未知";
   $("#metric-loader").textContent = String(status.loader || "unknown").toUpperCase();
   $("#metric-port").textContent = String(status.port || "—");
   $("#metric-address").textContent = `127.0.0.1:${status.port || "—"}`;
+  $("#metric-disk").textContent = status.storage?.free_gb === null || status.storage?.free_gb === undefined
+    ? "—" : `${Number(status.storage.free_gb).toFixed(1)} GB`;
+  $("#metric-disk-used").textContent = status.storage?.used_percent === null || status.storage?.used_percent === undefined
+    ? "等待读取" : `已使用 ${Number(status.storage.used_percent).toFixed(1)}%`;
   $("#detail-launch").textContent = `${server.launch_mode === "auto" ? "自动" : server.launch_mode} · ${server.detected?.target || "未检测"}`;
   $("#detail-memory").textContent = `${server.xms} – ${server.xmx}`;
   $("#detail-external").textContent = server.external_address || "未设置";
@@ -623,6 +646,102 @@ async function pickFolder() {
   finally { setBusy(button, false); }
 }
 
+function fillAutomation(data) {
+  const form = $("#automation-form");
+  form.elements.backup_schedule_enabled.checked = Boolean(data.backup_schedule_enabled);
+  form.elements.backup_interval_hours.value = data.backup_interval_hours ?? 6;
+  form.elements.restart_schedule_enabled.checked = Boolean(data.restart_schedule_enabled);
+  form.elements.restart_time.value = data.restart_time || "04:00";
+  $("#automation-last-backup").textContent = data.last_backup ? formatDate(data.last_backup) : "尚未执行";
+  $("#automation-next-backup").textContent = data.next_backup ? formatDate(data.next_backup) : "计划未启用";
+  $("#automation-last-restart").textContent = data.last_restart_date || "尚未执行";
+  $("#automation-next-restart").textContent = data.next_restart ? formatDate(data.next_restart) : "计划未启用";
+}
+
+async function refreshAutomation() {
+  if (!state.activeId || document.hidden) return;
+  try {
+    const payload = await api(`/api/automation?server_id=${encodeURIComponent(state.activeId)}`);
+    fillAutomation(payload.data);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function saveAutomation() {
+  if (!state.activeId) return;
+  const button = $("#automation-save");
+  const form = $("#automation-form");
+  const automation = {
+    backup_schedule_enabled: form.elements.backup_schedule_enabled.checked,
+    backup_interval_hours: Number(form.elements.backup_interval_hours.value),
+    restart_schedule_enabled: form.elements.restart_schedule_enabled.checked,
+    restart_time: form.elements.restart_time.value,
+  };
+  setBusy(button, true, "正在保存…");
+  try {
+    const payload = await api("/api/automation", { method: "POST", body: { server_id: state.activeId, automation } });
+    fillAutomation(payload.data);
+    toast(payload.message);
+    await bootstrap(state.activeId);
+  } catch (error) { toast(error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+function renderDiagnostics(data) {
+  state.diagnostics = data;
+  $("#diagnostic-java").textContent = data.java_version || "无法读取";
+  $("#diagnostic-loader").textContent = `${String(data.loader || "unknown").toUpperCase()}${data.game_version ? ` · ${data.game_version}` : ""}`;
+  $("#diagnostic-mods").textContent = String(data.mod_count ?? 0);
+  $("#diagnostic-crashes").textContent = String(data.crash_reports?.length ?? 0);
+  $("#diagnostic-disk").textContent = data.storage?.free_gb === null || data.storage?.free_gb === undefined
+    ? "无法读取" : `可用 ${Number(data.storage.free_gb).toFixed(1)} / ${Number(data.storage.total_gb).toFixed(1)} GB`;
+  $("#diagnostic-log-size").textContent = `${Number(data.latest_log_size_mb || 0).toFixed(2)} MB`;
+  $("#diagnostic-last-exit").textContent = data.last_exit
+    ? `退出码 ${data.last_exit.code} · ${formatDate(data.last_exit.at)}` : "本次面板启动后暂无记录";
+  $("#diagnostic-generated").textContent = formatDate(data.generated_at);
+
+  const errors = data.error_lines || [];
+  $("#diagnostic-error-count").textContent = String(errors.length);
+  $("#diagnostic-errors").innerHTML = errors.map((line, index) => `<li><span>${String(index + 1).padStart(2, "0")}</span><code>${escapeHtml(line)}</code></li>`).join("");
+  $("#diagnostic-errors-empty").classList.toggle("hidden", errors.length !== 0);
+
+  const crashes = data.crash_reports || [];
+  $("#crash-list").innerHTML = crashes.map((report) => `<article><div><strong>${escapeHtml(report.name)}</strong><span>${escapeHtml(formatDate(report.modified))} · ${Number(report.size_kb).toFixed(1)} KB</span></div><a class="row-button" href="/api/crash-report/download?server_id=${encodeURIComponent(state.activeId)}&name=${encodeURIComponent(report.name)}">下载</a></article>`).join("");
+  $("#crash-empty").classList.toggle("hidden", crashes.length !== 0);
+}
+
+async function refreshDiagnostics() {
+  if (!state.activeId || document.hidden) return;
+  const button = $("#diagnostic-refresh");
+  setBusy(button, true, "扫描中…");
+  try {
+    const payload = await api(`/api/diagnostics?server_id=${encodeURIComponent(state.activeId)}`);
+    renderDiagnostics(payload.data);
+  } catch (error) { toast(error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function copyDiagnosticSummary() {
+  const data = state.diagnostics;
+  if (!data) return toast("请先重新扫描诊断信息", "error");
+  const server = activeServer();
+  const summary = [
+    `Ripple Server Panel 诊断摘要`,
+    `服务端：${server?.name || "未知"}`,
+    `生成时间：${formatDate(data.generated_at)}`,
+    `Java：${data.java_version || "无法读取"}`,
+    `加载器：${data.loader || "unknown"} ${data.game_version || ""}`.trim(),
+    `Mod：启用 ${data.mod_count || 0}，停用 ${data.disabled_mod_count || 0}`,
+    `崩溃报告：${data.crash_reports?.length || 0}`,
+    `磁盘：可用 ${data.storage?.free_gb ?? "—"} GB，已用 ${data.storage?.used_percent ?? "—"}%`,
+    `最近错误：`,
+    ...(data.error_lines || []).slice(-20),
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(summary);
+    toast("诊断摘要已复制");
+  } catch { toast("浏览器拒绝访问剪贴板，请使用 HTTPS 或本机地址", "error"); }
+}
+
 function bindEvents() {
   $("#theme-toggle").addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
   $("#mobile-menu").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
@@ -665,6 +784,9 @@ function bindEvents() {
   $("#remove-server").addEventListener("click", removeServer);
   $("#player-form").addEventListener("submit", submitPlayerAction);
   $("#backup-create").addEventListener("click", createBackup);
+  $("#automation-save").addEventListener("click", saveAutomation);
+  $("#diagnostic-refresh").addEventListener("click", refreshDiagnostics);
+  $("#diagnostic-copy").addEventListener("click", copyDiagnosticSummary);
   $("#backup-table").addEventListener("click", (event) => {
     const button = event.target.closest("[data-backup-remove]");
     if (button) removeBackup(button);
