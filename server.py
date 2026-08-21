@@ -853,6 +853,38 @@ def action_lock(server_id: str) -> threading.Lock:
         return ACTION_LOCKS.setdefault(server_id, threading.Lock())
 
 
+def ensure_server_write_access(root: Path) -> None:
+    """Fail before launching Java when the panel cannot update the server files."""
+    if not root.is_dir():
+        raise FileNotFoundError(f"服务端目录不存在：{root}")
+
+    probe = root / f".ripple-write-test-{os.getpid()}-{uuid.uuid4().hex}.tmp"
+    try:
+        probe.write_bytes(b"")
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"面板没有服务端目录的写入权限：{root}。请关闭当前面板，再双击“启动面板.bat”；"
+            "如果仍然失败，请右键该文件并选择“以管理员身份运行”。"
+        ) from exc
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    for target in (root / "logs" / "latest.log", root / "logs" / "debug.log", root / "config" / "fml.toml"):
+        if not target.is_file():
+            continue
+        try:
+            with target.open("a", encoding="utf-8", errors="replace"):
+                pass
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"服务端文件正被占用或不可写：{target}。请确认旧服务端已经完全退出，"
+                "并重新启动本地面板。"
+            ) from exc
+
+
 def start_server(profile: dict[str, Any]) -> str:
     with action_lock(profile["id"]):
         status = server_is_running(profile)
@@ -861,6 +893,7 @@ def start_server(profile: dict[str, Any]) -> str:
         root = Path(profile["path"])
         if not eula_accepted(root):
             raise RuntimeError("尚未同意 Minecraft EULA，请先在启动配置中勾选同意")
+        ensure_server_write_access(root)
         command, description = build_launch(profile)
         DATA_ROOT.mkdir(parents=True, exist_ok=True)
         runtime_log = DATA_ROOT / f"runtime-{profile['id']}.log"
@@ -1449,7 +1482,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
 
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "RippleServerPanel/2.3"
+    server_version = "RippleServerPanel/2.3.1"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -1530,7 +1563,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 profiles = [public_profile(item) for item in settings["servers"]]
                 active = settings.get("active_server_id")
                 self._json({"ok": True, "data": {"servers": profiles, "active_server_id": active,
-                            "platform": sys.platform, "panel_version": "2.3.0"}})
+                            "platform": sys.platform, "panel_version": "2.3.1"}})
                 return
             if path == "/api/status":
                 profile = self._profile_from_query(query)

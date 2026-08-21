@@ -54,6 +54,10 @@ class RipplePanelTests(unittest.TestCase):
     def test_eula_allows_leading_spaces(self):
         self.assertTrue(server.eula_accepted(self.root))
 
+    def test_write_access_probe_is_removed(self):
+        server.ensure_server_write_access(self.root)
+        self.assertEqual(list(self.root.glob(".ripple-write-test-*.tmp")), [])
+
     def test_memory_validation(self):
         server.validate_memory("6G", "10G")
         with self.assertRaises(ValueError):
