@@ -8,8 +8,10 @@
   <title>Lodestar · Minecraft Server Studio</title>
   <link rel="stylesheet" href="/app.css">
   <link rel="stylesheet" href="/editorial.css">
+  <link rel="stylesheet" href="/report-theme.css">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
@@ -45,9 +47,11 @@
       </div>
     </aside>
 
-    <main class="main">
+    <button class="mobile-scrim" id="mobile-scrim" type="button" aria-label="关闭导航菜单" tabindex="-1"></button>
+
+    <main class="main" id="main-content" tabindex="-1">
       <header class="topbar">
-        <button class="mobile-menu icon-button" id="mobile-menu" aria-label="打开菜单">☰</button>
+        <button class="mobile-menu icon-button" id="mobile-menu" type="button" aria-label="打开导航菜单" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="server-heading">
           <div class="eyebrow" id="server-path">尚未导入服务端</div>
           <h1 id="server-title">Lodestar</h1>
@@ -400,6 +404,19 @@
           </div>
           <article class="panel-card security-copy"><h3>安全边界</h3><p>面板只监听 <code>127.0.0.1</code>，校验 Host 与 Origin，并限制可修改的配置路径。SakuraFRP 只映射 Minecraft 的游戏端口，切勿映射面板的 <code>8765</code> 端口。</p><p>这是管理工具，不会自动解决 Mod 依赖或兼容性；更换 Mod 前建议先创建世界备份。</p></article>
         </section>
+
+        <footer class="app-footer">
+          <div class="footer-statement">
+            <span class="overline">Lodestar · Local by design</span>
+            <strong>让每一个世界，都有清晰可靠的后台。</strong>
+          </div>
+          <nav class="footer-links" aria-label="快捷导航">
+            <button type="button" data-view-jump="console">控制台</button>
+            <button type="button" data-view-jump="backups">世界备份</button>
+            <button type="button" data-view-jump="diagnostics">运行诊断</button>
+          </nav>
+          <div class="footer-local"><i class="status-dot safe"></i><span>127.0.0.1 · 仅限本机</span></div>
+        </footer>
       </div>
     </main>
   </div>

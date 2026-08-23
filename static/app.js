@@ -152,7 +152,9 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("lodestar-theme", theme);
   const meta = $('meta[name="theme-color"]');
-  if (meta) meta.content = theme === "dark" ? "#191917" : "#f6f4ee";
+  if (meta) meta.content = theme === "dark" ? "#181816" : "#faf9f5";
+  const toggle = $("#theme-toggle");
+  if (toggle) toggle.setAttribute("aria-label", theme === "dark" ? "切换浅色模式" : "切换深色模式");
 }
 
 function initializeTheme() {
@@ -171,11 +173,25 @@ function closeImportModal() {
   $("#import-modal").classList.add("hidden");
 }
 
+function setMobileMenu(open) {
+  const sidebar = $("#sidebar");
+  const button = $("#mobile-menu");
+  sidebar.classList.toggle("open", open);
+  document.body.classList.toggle("menu-open", open);
+  button.setAttribute("aria-expanded", String(open));
+  button.setAttribute("aria-label", open ? "关闭导航菜单" : "打开导航菜单");
+}
+
 function showView(view) {
   state.view = view;
-  $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  $$(".nav-item").forEach((button) => {
+    const active = button.dataset.view === view;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
   $$(".view").forEach((panel) => panel.classList.toggle("active", panel.dataset.viewPanel === view));
-  $("#sidebar").classList.remove("open");
+  setMobileMenu(false);
   if (!state.activeId) return;
   if (view === "console") refreshLogs();
   if (view === "performance") refreshPerformance();
@@ -1165,7 +1181,8 @@ async function copyDiagnosticSummary() {
 
 function bindEvents() {
   $("#theme-toggle").addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
-  $("#mobile-menu").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
+  $("#mobile-menu").addEventListener("click", () => setMobileMenu(!$("#sidebar").classList.contains("open")));
+  $("#mobile-scrim").addEventListener("click", () => setMobileMenu(false));
   $("#import-open").addEventListener("click", openImportModal);
   $("#empty-import").addEventListener("click", openImportModal);
   $$('[data-modal-close]').forEach((button) => button.addEventListener("click", closeImportModal));
@@ -1275,7 +1292,11 @@ function bindEvents() {
     const button = event.target.closest("[data-backup-remove]");
     if (button) removeBackup(button);
   });
-  document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeImportModal(); });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    closeImportModal();
+    setMobileMenu(false);
+  });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) { refreshStatus(); refreshCurrentView(); } });
 }
 
