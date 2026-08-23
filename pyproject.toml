@@ -15,3 +15,7 @@ classifiers = [
   "Topic :: Games/Entertainment",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Nineu1124/lodestar-minecraft-server-studio"
+Issues = "https://github.com/Nineu1124/lodestar-minecraft-server-studio/issues"
