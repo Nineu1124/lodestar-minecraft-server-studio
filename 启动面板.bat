@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Ripple Server Panel
+title Lodestar Minecraft Server Studio
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -16,4 +16,3 @@ if errorlevel 1 (
   echo 面板启动失败，请将上面的错误内容发给项目维护者。
   pause
 )
-

@@ -1,11 +1,11 @@
 [project]
-name = "ripple-server-panel"
-version = "2.3.1"
-description = "Local web control panel for multiple Minecraft modpack servers"
+name = "lodestar-minecraft-server-studio"
+version = "3.0.0"
+description = "Import a Minecraft server ZIP and launch it from a local web studio"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Ripple Server Panel contributors" }]
+authors = [{ name = "Lodestar contributors" }]
 keywords = ["minecraft", "server", "forge", "fabric", "paper", "web-panel"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -15,7 +15,3 @@ classifiers = [
   "Topic :: Games/Entertainment",
 ]
 dependencies = []
-
-[project.urls]
-Homepage = "https://github.com/your-name/ripple-server-panel"
-Issues = "https://github.com/your-name/ripple-server-panel/issues"

@@ -1,6 +1,6 @@
 # Security Policy
 
-Ripple Server Panel is designed for local-machine use. Its browser console can execute Minecraft administrator commands and its backend can write to imported server folders.
+Lodestar is designed for local-machine use. Its browser console can execute Minecraft administrator commands and its backend can write to imported server folders.
 
 ## Supported use
 
@@ -12,4 +12,3 @@ Ripple Server Panel is designed for local-machine use. Its browser console can e
 ## Reporting a vulnerability
 
 When publishing this repository, replace this section with a private security contact or enable GitHub private vulnerability reporting. Do not include real server paths, FRP tokens, logs containing player IPs, or launcher credentials in an issue.
-

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#c9653b">
-  <title>Ripple Server Panel</title>
+  <title>Lodestar · Minecraft Server Studio</title>
   <link rel="stylesheet" href="/app.css">
   <link rel="stylesheet" href="/editorial.css">
 </head>
@@ -14,9 +14,9 @@
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <img src="/assets/ripple-emblem.png" alt="">
+          <img src="/assets/lodestar-emblem.png" alt="">
         </div>
-        <div><strong>Ripple</strong><span>Server Panel</span></div>
+        <div><strong>Lodestar</strong><span>Server Studio</span></div>
       </div>
 
       <div class="server-library">
@@ -26,8 +26,10 @@
 
       <nav class="nav-list" aria-label="主导航">
         <button class="nav-item active" data-view="dashboard"><span>⌂</span>概览</button>
+        <button class="nav-item" data-view="performance"><span>⌁</span>性能趋势</button>
         <button class="nav-item" data-view="console"><span>›_</span>控制台</button>
-        <button class="nav-item" data-view="mods"><span>◇</span>Mod 管理</button>
+        <button class="nav-item" data-view="mods"><span>◇</span>Mod 与插件</button>
+        <button class="nav-item" data-view="files"><span>⌑</span>文件管理</button>
         <button class="nav-item" data-view="settings"><span>⚙</span>配置与启动</button>
         <button class="nav-item" data-view="players"><span>♙</span>玩家管理</button>
         <button class="nav-item" data-view="rules"><span>◌</span>游戏规则</button>
@@ -48,7 +50,7 @@
         <button class="mobile-menu icon-button" id="mobile-menu" aria-label="打开菜单">☰</button>
         <div class="server-heading">
           <div class="eyebrow" id="server-path">尚未导入服务端</div>
-          <h1 id="server-title">Ripple Server Panel</h1>
+          <h1 id="server-title">Lodestar</h1>
         </div>
         <div class="top-actions">
           <div class="status-pill offline" id="status-pill"><i></i><span>未连接</span></div>
@@ -117,6 +119,24 @@
           </div>
         </section>
 
+        <section class="view" data-view-panel="performance">
+          <div class="view-heading editorial-heading">
+            <div><span class="overline">运行采样</span><h2>看见服务器的呼吸。</h2><p>面板开启期间记录 CPU、JVM 内存和在线人数，不写入服务端目录。</p></div>
+            <button class="button ghost" id="performance-refresh">立即采样</button>
+          </div>
+          <div class="performance-summary">
+            <article><span>CPU 峰值</span><strong id="performance-cpu-peak">—</strong></article>
+            <article><span>内存峰值</span><strong id="performance-memory-peak">—</strong></article>
+            <article><span>玩家峰值</span><strong id="performance-player-peak">—</strong></article>
+            <article><span>采样点</span><strong id="performance-samples">0</strong></article>
+          </div>
+          <div class="performance-charts">
+            <article><header><div><span class="overline">CPU</span><h3>处理器负载</h3></div><strong id="performance-cpu-now">—</strong></header><div class="metric-bars" id="performance-cpu-chart" aria-label="CPU 历史图"></div></article>
+            <article><header><div><span class="overline">JVM</span><h3>内存占用</h3></div><strong id="performance-memory-now">—</strong></header><div class="metric-bars" id="performance-memory-chart" aria-label="内存历史图"></div></article>
+            <article><header><div><span class="overline">Players</span><h3>在线人数</h3></div><strong id="performance-players-now">—</strong></header><div class="metric-bars" id="performance-player-chart" aria-label="在线人数历史图"></div></article>
+          </div>
+        </section>
+
         <section class="view" data-view-panel="console">
           <div class="view-heading">
             <div><span class="overline">实时日志与指令</span><h2>服务器控制台</h2><p>支持执行 Minecraft 服务端指令，不需要输入开头的斜杠。</p></div>
@@ -129,20 +149,45 @@
               <span>›</span><input id="command-input" autocomplete="off" spellcheck="false" placeholder="输入指令，例如：list、say 服务器将在 5 分钟后重启"><button type="submit">执行</button>
             </form>
           </div>
+          <section class="command-library" aria-labelledby="command-library-title">
+            <div class="command-library-heading">
+              <div><span class="overline">常驻指令库</span><h3 id="command-library-title">常用服务器指令</h3></div>
+              <input id="command-search" type="search" placeholder="搜索指令、用途或参数" aria-label="搜索常用服务器指令">
+            </div>
+            <div class="command-categories" id="command-categories"></div>
+            <div class="command-reference" id="command-reference"></div>
+          </section>
           <div class="hint-strip"><strong>提示</strong><span>面板只在本机开放，但控制台拥有管理员权限。不要执行来源不明的指令。</span></div>
         </section>
 
         <section class="view" data-view-panel="mods">
           <div class="view-heading">
-            <div><span class="overline">整合包维护</span><h2>Mod 管理</h2><p>上传、启用、停用或恢复 Mod；改动需要重启服务端生效。</p></div>
-            <div class="heading-actions"><input class="search-input" id="mod-search" placeholder="搜索名称或 Mod ID"><label class="button primary upload-button">添加 Mod<input type="file" id="mod-upload" accept=".jar" multiple hidden></label></div>
+            <div><span class="overline">服务端内容</span><h2 id="content-heading">Mod 管理</h2><p id="content-description">上传、启用、停用或恢复 Mod；改动需要重启服务端生效。</p></div>
+            <div class="heading-actions"><input class="search-input" id="mod-search" placeholder="搜索名称或 ID"><label class="button primary upload-button"><span id="content-upload-label">添加 Mod</span><input type="file" id="mod-upload" accept=".jar" multiple hidden></label></div>
           </div>
+          <div class="content-kind-switch" id="content-kind-switch"><button type="button" class="active" data-content-kind="mods">Mods</button><button type="button" data-content-kind="plugins">Plugins</button></div>
           <div class="segmented" id="mod-filter"><button class="active" data-mod-state="all">全部 <b id="mod-count-all">0</b></button><button data-mod-state="enabled">已启用 <b id="mod-count-enabled">0</b></button><button data-mod-state="disabled">已停用 <b id="mod-count-disabled">0</b></button><button data-mod-state="trash">回收站 <b id="mod-count-trash">0</b></button></div>
           <div class="table-card">
-            <table><thead><tr><th>Mod</th><th>版本</th><th>大小</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody id="mod-table"></tbody></table>
-            <div class="table-empty hidden" id="mod-empty">没有符合条件的 Mod</div>
+            <table><thead><tr><th id="content-table-label">Mod</th><th>版本</th><th>大小</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody id="mod-table"></tbody></table>
+            <div class="table-empty hidden" id="mod-empty">没有符合条件的内容</div>
           </div>
-          <div class="hint-strip warning"><strong>兼容性</strong><span>面板不会自动判断所有前置依赖。请确保 Mod 对应相同的 Minecraft 版本和 Forge/Fabric/NeoForge 加载器。</span></div>
+          <div class="hint-strip warning"><strong>兼容性</strong><span>Mod 需要匹配游戏版本与加载器；插件需要 Bukkit/Paper 兼容端或 Luminara、Arclight、Mohist 等混合端。</span></div>
+        </section>
+
+        <section class="view" data-view-panel="files">
+          <div class="view-heading">
+            <div><span class="overline">服务端文件</span><h2>文件管理器</h2><p>浏览、上传、下载和编辑配置；删除操作会进入面板回收站。</p></div>
+            <div class="heading-actions"><button class="button ghost" type="button" id="file-new-folder">新建文件夹</button><label class="button primary"><span id="file-upload-label">上传文件</span><input type="file" id="file-upload" multiple hidden></label></div>
+          </div>
+          <div class="file-toolbar"><button type="button" id="file-up">← 上一级</button><nav id="file-breadcrumb" aria-label="当前文件路径"></nav><button type="button" id="file-refresh">刷新</button></div>
+          <div class="table-card file-table-card">
+            <table><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th class="align-right">操作</th></tr></thead><tbody id="file-table"></tbody></table>
+            <div class="table-empty hidden" id="file-empty">这个目录是空的</div>
+          </div>
+          <section class="file-editor hidden" id="file-editor">
+            <div class="card-heading"><div><span class="overline">文本编辑器</span><h3 id="file-editor-title">配置文件</h3></div><div class="heading-actions"><button type="button" class="button ghost small" id="file-editor-close">关闭</button><button type="button" class="button primary small" id="file-editor-save">保存文件</button></div></div>
+            <textarea id="file-editor-content" spellcheck="false"></textarea>
+          </section>
         </section>
 
         <section class="view" data-view-panel="settings">
@@ -316,6 +361,16 @@
             <div><dt>上次退出</dt><dd id="diagnostic-last-exit">本次面板启动后暂无记录</dd></div>
             <div><dt>扫描时间</dt><dd id="diagnostic-generated">—</dd></div>
           </dl>
+          <section class="diagnosis-card hidden" id="diagnosis-card">
+            <div><span class="overline">自动结论</span><h3 id="diagnosis-title">启动失败</h3></div>
+            <p id="diagnosis-detail"></p>
+            <ul id="diagnosis-suggestions"></ul>
+            <span class="diagnosis-source" id="diagnosis-source"></span>
+          </section>
+          <section class="preflight-panel">
+            <div class="card-heading"><div><span class="overline">启动前检查</span><h3>环境与安全边界</h3></div><span class="state-badge" id="preflight-state">扫描中</span></div>
+            <div class="preflight-list" id="preflight-list"></div>
+          </section>
           <div class="diagnostic-layout">
             <article class="signal-panel">
               <div class="card-heading"><div><span class="overline">日志信号</span><h3>最近的警告与错误</h3></div><span class="count-badge" id="diagnostic-error-count">0</span></div>
@@ -331,7 +386,7 @@
         </section>
 
         <section class="view" data-view-panel="about">
-          <div class="view-heading editorial-heading"><div><span class="overline">开源本地工具</span><h2>把复杂的整合包服，变成一件从容的事。</h2><p>Ripple Server Panel 是一个面向整合包服主的本地 Web 管理面板。</p></div><span class="version-tag">v2.3.1</span></div>
+          <div class="view-heading editorial-heading"><div><span class="overline">本地服务端工作台</span><h2>从压缩包，到一个正在运行的世界。</h2><p>Lodestar 专注于在本机导入、配置和运行 Minecraft 服务端。</p></div><span class="version-tag">v3.0.0</span></div>
           <div class="feature-grid">
             <article class="feature-card"><i>⌘</i><h3>多实例</h3><p>导入并切换不同服务端，自动识别常见加载器和启动文件。</p></article>
             <article class="feature-card"><i>›_</i><h3>网页控制台</h3><p>查看实时日志，发送任意 Minecraft 服务端指令。</p></article>
@@ -350,17 +405,60 @@
   </div>
 
   <div class="modal-backdrop hidden" id="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
-    <form class="modal" id="import-form">
-      <div class="modal-heading"><div><span class="overline">添加实例</span><h2 id="import-title">导入 Minecraft 服务端</h2></div><button type="button" class="icon-button" data-modal-close>×</button></div>
-      <p>选择包含 <code>server.properties</code>、服务端 JAR 或启动脚本的文件夹。面板不会复制整合包文件。</p>
-      <label><span>服务端文件夹</span><div class="input-action"><input id="import-path" name="path" required placeholder="D:\MC-Servers\MyServer"><button type="button" class="button soft" id="pick-folder">选择文件夹</button></div></label>
-      <div class="form-grid two">
-        <label><span>显示名称（可选）</span><input name="name" placeholder="我的整合包服务器"></label>
-        <label><span>Java（可选）</span><input name="java" placeholder="留空则使用系统 Java"></label>
-        <label><span>最小内存</span><input name="xms" value="2G"></label>
-        <label><span>最大内存</span><input name="xmx" value="8G"></label>
+    <form class="modal import-wizard" id="import-form">
+      <div class="modal-heading"><div><span class="overline">创建实例</span><h2 id="import-title">导入并开服</h2></div><button type="button" class="icon-button" data-modal-close>×</button></div>
+      <div class="source-tabs" role="tablist">
+        <button type="button" class="active" data-import-source="archive">服务端压缩包</button>
+        <button type="button" data-import-source="folder">已解压文件夹</button>
       </div>
-      <div class="modal-actions"><button type="button" class="button ghost" data-modal-close>取消</button><button type="submit" class="button primary">检测并导入</button></div>
+
+      <section data-import-panel="archive">
+        <div class="wizard-step"><span>01</span><div><strong>选择原生服务端包</strong><small>支持 ZIP；面板会检查目录、加载器、版本、启动文件和空间需求。</small></div></div>
+        <label><span>压缩包路径</span><div class="input-action"><input id="archive-path" placeholder="D:\MC_server\服务端压缩包\MyServer.zip"><button type="button" class="button soft" id="pick-archive">选择压缩包</button></div></label>
+        <div class="archive-review hidden" id="archive-review">
+          <div class="archive-summary" id="archive-summary"></div>
+          <div class="wizard-step"><span>02</span><div><strong>确认开服参数</strong><small>这些参数只作用于新导入的实例，之后仍可在配置页修改。</small></div></div>
+          <div class="setup-mode" role="radiogroup" aria-label="开服方式">
+            <label><input type="radio" name="setup_mode" value="quick" checked><span><strong>一键推荐</strong><small>自动选择 Java、启动器和常用配置</small></span></label>
+            <label><input type="radio" name="setup_mode" value="custom"><span><strong>自定义</strong><small>完整确认启动与世界参数</small></span></label>
+          </div>
+          <div class="form-grid two import-fields">
+            <label><span>实例名称</span><input name="archive_name" maxlength="80"></label>
+            <label><span>解压到</span><input name="destination"></label>
+            <label class="wide"><span>Java</span><select name="archive_java" id="archive-java"></select></label>
+            <label><span>最小内存</span><input name="archive_xms" value="2G"></label>
+            <label><span>最大内存</span><input name="archive_xmx" value="8G"></label>
+            <label class="wide"><span>启动文件</span><select name="archive_launch" id="archive-launch"></select></label>
+            <label><span>监听端口</span><input type="number" name="server_port" min="1" max="65535" value="25565"></label>
+            <label><span>最大玩家</span><input type="number" name="max_players" min="1" max="500" value="20"></label>
+            <label><span>视距</span><input type="number" name="view_distance" min="2" max="32" value="10"></label>
+            <label><span>模拟距离</span><input type="number" name="simulation_distance" min="2" max="32" value="8"></label>
+            <label><span>游戏模式</span><select name="gamemode"><option value="survival">生存</option><option value="creative">创造</option><option value="adventure">冒险</option><option value="spectator">旁观</option></select></label>
+            <label><span>难度</span><select name="difficulty"><option value="normal">普通</option><option value="easy">简单</option><option value="hard">困难</option><option value="peaceful">和平</option></select></label>
+          </div>
+          <div class="switch-grid import-switches">
+            <label class="switch-row"><span><strong>正版验证</strong></span><input name="online_mode" type="checkbox" checked><i></i></label>
+            <label class="switch-row"><span><strong>安全档案验证</strong></span><input name="secure_profile" type="checkbox" checked><i></i></label>
+            <label class="switch-row"><span><strong>允许飞行</strong></span><input name="allow_flight" type="checkbox"><i></i></label>
+            <label class="switch-row"><span><strong>启用白名单</strong></span><input name="whitelist" type="checkbox"><i></i></label>
+          </div>
+          <label class="agreement-row"><input type="checkbox" name="accept_eula" required><span>我已阅读并同意 Minecraft EULA</span></label>
+          <label class="agreement-row"><input type="checkbox" name="start_after_import" checked><span>导入完成后立即启动服务器</span></label>
+        </div>
+        <div class="import-progress hidden" id="import-progress"><div><span id="import-progress-label">准备导入…</span><strong id="import-progress-value">0%</strong></div><i><b id="import-progress-bar"></b></i></div>
+      </section>
+
+      <section class="hidden" data-import-panel="folder">
+        <p>已有解压目录不会被复制；面板会直接使用其中的世界、配置和启动文件。</p>
+        <label><span>服务端文件夹</span><div class="input-action"><input id="import-path" name="path" placeholder="D:\MC-Servers\MyServer"><button type="button" class="button soft" id="pick-folder">选择文件夹</button></div></label>
+        <div class="form-grid two">
+          <label><span>显示名称</span><input name="name" placeholder="我的整合包服务器"></label>
+          <label><span>Java</span><input name="java" placeholder="留空则使用系统 Java"></label>
+          <label><span>最小内存</span><input name="xms" value="2G"></label>
+          <label><span>最大内存</span><input name="xmx" value="8G"></label>
+        </div>
+      </section>
+      <div class="modal-actions"><button type="button" class="button ghost" data-modal-close>取消</button><button type="submit" class="button primary" id="import-submit">检查压缩包</button></div>
     </form>
   </div>
 

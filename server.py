@@ -17,6 +17,7 @@ import time
 import uuid
 import webbrowser
 import zipfile
+from collections import defaultdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,10 +30,16 @@ STATIC_ROOT = APP_ROOT / "static"
 DATA_ROOT = APP_ROOT / "data"
 SETTINGS_PATH = DATA_ROOT / "settings.json"
 SCHEDULER_STATE_PATH = DATA_ROOT / "scheduler-state.json"
-HOST = os.environ.get("RIPPLE_PANEL_HOST", "127.0.0.1")
-PORT = int(os.environ.get("RIPPLE_PANEL_PORT", "8765"))
+APP_NAME = "Lodestar"
+APP_VERSION = "3.0.0"
+HOST = os.environ.get("LODESTAR_PANEL_HOST", os.environ.get("RIPPLE_PANEL_HOST", "127.0.0.1"))
+PORT = int(os.environ.get("LODESTAR_PANEL_PORT", os.environ.get("RIPPLE_PANEL_PORT", "8765")))
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_MOD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILE_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+MAX_TEXT_FILE_BYTES = 4 * 1024 * 1024
+MAX_ARCHIVE_FILES = 200_000
+MAX_ARCHIVE_EXPANDED_BYTES = 80 * 1024 * 1024 * 1024
 
 CONFIG_LOCK = threading.RLock()
 ACTION_LOCKS: dict[str, threading.Lock] = {}
@@ -42,6 +49,7 @@ JOBS_LOCK = threading.RLock()
 JOBS: dict[str, dict[str, Any]] = {}
 METRICS_LOCK = threading.RLock()
 CPU_SAMPLES: dict[int, tuple[float, int]] = {}
+METRIC_HISTORY: dict[str, list[dict[str, Any]]] = {}
 SCHEDULER_LOCK = threading.RLock()
 LAST_EXITS: dict[str, dict[str, Any]] = {}
 
@@ -51,6 +59,7 @@ PLAYER_NAME = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MEMORY_VALUE = re.compile(r"^[1-9][0-9]{0,3}[MG]$", re.I)
 SAFE_COMMAND = re.compile(r"^[^\x00-\x1f\x7f]{1,500}$")
 SAFE_FILE = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]{1,180}$")
+SAFE_ARCHIVE_NAME = re.compile(r"^[^<>:\"|?*\x00-\x1f]{1,240}$")
 
 INT_SETTINGS = {
     "max-players": (1, 500),
@@ -364,6 +373,450 @@ def detect_launch(root: Path) -> dict[str, Any]:
     return result
 
 
+def discover_java_runtimes() -> list[dict[str, str]]:
+    """Return locally available Java executables without modifying PATH."""
+    candidates: list[Path] = []
+    configured = shutil.which("java")
+    if configured:
+        candidates.append(Path(configured))
+    if os.name == "nt":
+        runtime_root = Path.home() / "AppData/Roaming/.minecraft/runtime"
+        if runtime_root.is_dir():
+            candidates.extend(runtime_root.glob("*/windows*/**/bin/java.exe"))
+            candidates.extend(runtime_root.glob("*/bin/java.exe"))
+        for env_name in ("JAVA_HOME", "JDK_HOME"):
+            if os.environ.get(env_name):
+                candidates.append(Path(os.environ[env_name]) / "bin/java.exe")
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved).casefold()
+        if key in seen or not resolved.is_file():
+            continue
+        seen.add(key)
+        label = resolved.parent.parent.name or "Java"
+        unique.append({"path": str(resolved), "label": label})
+    return unique
+
+
+def recommended_java(game_version: str, runtimes: list[dict[str, str]] | None = None) -> str:
+    runtimes = runtimes or discover_java_runtimes()
+    if not runtimes:
+        return shutil.which("java") or "java"
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", game_version or "")
+    wanted = 17
+    if match:
+        minor = int(match.group(2))
+        patch = int(match.group(3) or 0)
+        if minor <= 16:
+            wanted = 8
+        elif minor > 20 or (minor == 20 and patch >= 5):
+            wanted = 21
+    hints = {
+        8: ("java-runtime-legacy", "jre-legacy", "jdk8", "java8"),
+        17: ("java-runtime-beta", "java-runtime-gamma", "jdk17", "java17"),
+        21: ("java-runtime-delta", "java-runtime-gamma", "jdk21", "java21"),
+    }
+    for runtime in runtimes:
+        lower = runtime["path"].casefold()
+        if any(hint in lower for hint in hints[wanted]):
+            return runtime["path"]
+    return runtimes[0]["path"]
+
+
+def decoded_zip_name(info: zipfile.ZipInfo) -> str:
+    """Recover common GBK filenames from ZIPs created by older Chinese tools."""
+    name = info.filename.replace("\\", "/")
+    if info.flag_bits & 0x800:
+        return name
+    try:
+        recovered = name.encode("cp437").decode("gbk")
+        if "�" not in recovered:
+            return recovered
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return name
+
+
+def normalized_archive_member(info: zipfile.ZipInfo) -> str:
+    name = decoded_zip_name(info).strip().replace("\\", "/")
+    while name.startswith("./"):
+        name = name[2:]
+    parts = [part for part in name.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"压缩包包含不安全路径：{name or '(空路径)'}")
+    if re.match(r"^[A-Za-z]:", parts[0]) or name.startswith("/"):
+        raise ValueError(f"压缩包包含绝对路径：{name}")
+    if any(not SAFE_ARCHIVE_NAME.fullmatch(part) for part in parts):
+        raise ValueError(f"压缩包包含 Windows 不支持的文件名：{name}")
+    return "/".join(parts)
+
+
+def archive_member_is_symlink(info: zipfile.ZipInfo) -> bool:
+    return ((info.external_attr >> 16) & 0o170000) == 0o120000
+
+
+def archive_layout(names: list[str], script_contents: dict[str, str] | None = None) -> dict[str, Any]:
+    script_contents = script_contents or {}
+    scores: dict[str, int] = defaultdict(int)
+    evidence: dict[str, set[str]] = defaultdict(set)
+    files = [name.rstrip("/") for name in names if name and not name.endswith("/")]
+
+    def mark(root: str, score: int, item: str) -> None:
+        scores[root.strip("/")] += score
+        evidence[root.strip("/")].add(item)
+
+    for name in files:
+        parts = name.split("/")
+        base = parts[-1].casefold()
+        parent = "/".join(parts[:-1])
+        if base == "server.properties":
+            mark(parent, 60, "server.properties")
+        elif base == "eula.txt":
+            mark(parent, 35, "eula.txt")
+        elif base in {"run.bat", "start.bat", "serverstart.bat", "startserver.bat", ".run.bat",
+                      "run.sh", "start.sh", ".run.sh"}:
+            mark(parent, 30, parts[-1])
+        if len(parts) >= 6 and parts[-1].casefold() == "win_args.txt" and "libraries" in [p.casefold() for p in parts]:
+            lib_index = [p.casefold() for p in parts].index("libraries")
+            mark("/".join(parts[:lib_index]), 70, "Forge/NeoForge 参数文件")
+
+    candidate_roots = set(scores)
+    for root in list(candidate_roots):
+        prefix = f"{root}/" if root else ""
+        for name in files:
+            if not name.startswith(prefix):
+                continue
+            relative = name[len(prefix):]
+            if "/" not in relative and relative.casefold().endswith(".jar"):
+                mark(root, 20, relative)
+            elif relative.casefold().startswith("mods/"):
+                mark(root, 4, "mods")
+            elif relative.casefold().startswith("plugins/"):
+                mark(root, 4, "plugins")
+            elif relative.casefold().startswith("libraries/"):
+                mark(root, 4, "libraries")
+
+    ordered = sorted(scores, key=lambda root: (-scores[root], root.count("/"), len(root)))
+    selected = ordered[0] if ordered else ""
+    prefix = f"{selected}/" if selected else ""
+    direct_files = [name[len(prefix):] for name in files if name.startswith(prefix) and "/" not in name[len(prefix):]]
+    candidates: list[dict[str, str]] = []
+    lower_names = {name.casefold(): name for name in files}
+    forge_matches = [name for name in files if name.startswith(prefix) and re.search(
+        r"libraries/net/(?:minecraftforge/forge|neoforged/neoforge)/[^/]+/win_args\.txt$", name, re.I)]
+    if forge_matches:
+        relative = forge_matches[0][len(prefix):]
+        label = "NeoForge 参数文件" if "neoforged" in relative.casefold() else "Forge 参数文件"
+        candidates.append({"mode": "forge_args", "target": relative, "label": label})
+    jar_files = sorted([name for name in direct_files if name.casefold().endswith(".jar")], key=str.casefold)
+    for name in jar_files:
+        candidates.append({"mode": "jar", "target": name, "label": name})
+    preferred_scripts = ("run.bat", "start.bat", "serverstart.bat", "startserver.bat", ".run.bat",
+                         "run.sh", "start.sh", ".run.sh")
+    for wanted in preferred_scripts:
+        match_name = next((name for name in direct_files if name.casefold() == wanted), None)
+        if match_name:
+            candidates.append({"mode": "script", "target": match_name, "label": f"启动脚本 · {match_name}"})
+
+    recommended: dict[str, str] | None = None
+    recommendation_reason = ""
+    for script_name, content in script_contents.items():
+        if prefix and not script_name.startswith(prefix):
+            continue
+        relative_script = script_name[len(prefix):]
+        if "/" in relative_script:
+            continue
+        jar_match = re.search(r"(?:^|\s)-jar\s+[\"']?([^\s\"']+\.jar)", content, re.I | re.M)
+        if jar_match:
+            jar_name = Path(jar_match.group(1).replace("\\", "/")).name
+            match_candidate = next((item for item in candidates if item["mode"] == "jar"
+                                    and item["target"].casefold() == jar_name.casefold()), None)
+            if match_candidate:
+                recommended = match_candidate
+                recommendation_reason = f"原启动脚本 {relative_script} 指向此 JAR"
+                break
+        args_match = re.search(r"@([^\s\"']*win_args\.txt)", content, re.I)
+        if args_match:
+            args_target = args_match.group(1).replace("\\", "/")
+            match_candidate = next((item for item in candidates if item["mode"] == "forge_args"
+                                    and item["target"].casefold() == args_target.casefold()), None)
+            if match_candidate:
+                recommended = match_candidate
+                recommendation_reason = f"原启动脚本 {relative_script} 使用此参数文件"
+                break
+    if recommended is None:
+        hybrid_tokens = ("luminara", "arclight", "mohist", "magma", "banner", "catserver", "youer")
+        recommended = next((item for item in candidates if item["mode"] == "jar"
+                            and any(token in item["target"].casefold() for token in hybrid_tokens)), None)
+        if recommended:
+            recommendation_reason = "识别到插件混合服务端核心"
+    if recommended is None and candidates:
+        recommended = candidates[0]
+        recommendation_reason = "按加载器与服务端文件结构自动选择"
+
+    loader = "unknown"
+    version = "未知"
+    joined = "\n".join(name.casefold() for name in files)
+    version_match = re.search(r"libraries/net/minecraftforge/forge/(\d+\.\d+(?:\.\d+)?)-", joined)
+    if version_match:
+        loader, version = "forge", version_match.group(1)
+    else:
+        version_match = re.search(r"libraries/net/neoforged/neoforge/([^/]+)/", joined)
+        if version_match:
+            loader, version = "neoforge", version_match.group(1)
+        elif any("fabric" in name.casefold() for name in direct_files):
+            loader = "fabric"
+        elif any("purpur" in name.casefold() for name in direct_files):
+            loader = "purpur"
+        elif any(token in name.casefold() for name in direct_files for token in ("paper", "spigot")):
+            loader = "paper"
+        elif jar_files:
+            loader = "vanilla"
+
+    return {
+        "root": selected,
+        "root_candidates": [
+            {"path": root, "score": scores[root], "evidence": sorted(evidence[root])}
+            for root in ordered[:8]
+        ],
+        "loader": loader,
+        "version": version,
+        "launch_candidates": candidates,
+        "recommended_launch": recommended,
+        "recommendation_reason": recommendation_reason,
+        "has_properties": f"{prefix}server.properties".casefold() in lower_names,
+        "has_eula": f"{prefix}eula.txt".casefold() in lower_names,
+        "has_world": any(name.startswith(f"{prefix}world/") for name in files),
+    }
+
+
+def inspect_server_archive(path_text: str) -> dict[str, Any]:
+    if not isinstance(path_text, str) or not path_text.strip():
+        raise ValueError("请选择服务端压缩包")
+    path = Path(path_text.strip().strip('"')).expanduser().resolve()
+    if not path.is_file() or path.suffix.casefold() != ".zip":
+        raise ValueError("目前支持 ZIP 格式的服务端压缩包")
+    names: list[str] = []
+    expanded = 0
+    compressed = 0
+    encrypted = False
+    script_contents: dict[str, str] = {}
+    with zipfile.ZipFile(path) as archive:
+        if len(archive.infolist()) > MAX_ARCHIVE_FILES:
+            raise ValueError(f"压缩包文件数量超过上限（{MAX_ARCHIVE_FILES:,}）")
+        for info in archive.infolist():
+            name = normalized_archive_member(info)
+            if archive_member_is_symlink(info):
+                raise ValueError(f"压缩包包含不支持的符号链接：{name}")
+            expanded += info.file_size
+            compressed += info.compress_size
+            encrypted = encrypted or bool(info.flag_bits & 0x1)
+            if expanded > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("压缩包解压后的体积超过 80 GB 安全上限")
+            names.append(name + ("/" if info.is_dir() and not name.endswith("/") else ""))
+            if (not info.is_dir() and info.file_size <= 256_000
+                    and Path(name).suffix.casefold() in {".bat", ".cmd", ".sh"}):
+                script_contents[name] = archive.read(info).decode("utf-8", errors="replace")
+    if encrypted:
+        raise ValueError("暂不支持带密码的服务端压缩包")
+    layout = archive_layout(names, script_contents)
+    if not layout["launch_candidates"]:
+        raise ValueError("没有在压缩包中找到可用的服务端 JAR、Forge 参数文件或启动脚本")
+    archive_parent_name = path.parent.name.casefold()
+    import_parent = path.parent.parent if ("压缩包" in archive_parent_name or archive_parent_name in {"archives", "packages"}) else path.parent
+    default_destination = import_parent / path.stem
+    if default_destination.exists():
+        default_destination = import_parent / "面板导入" / path.stem
+    runtimes = discover_java_runtimes()
+    warnings: list[str] = []
+    if not layout["has_properties"]:
+        warnings.append("首次启动时将创建 server.properties")
+    if layout["has_world"]:
+        warnings.append("压缩包包含现有世界，导入后会继续使用")
+    return {
+        "path": str(path),
+        "name": path.stem,
+        "archive_size": path.stat().st_size,
+        "expanded_size": expanded,
+        "file_count": len(names),
+        "destination": str(default_destination),
+        **layout,
+        "java_runtimes": runtimes,
+        "recommended_java": recommended_java(layout["version"], runtimes),
+        "warnings": warnings,
+    }
+
+
+def pick_server_archive() -> str:
+    if os.name != "nt":
+        raise ValueError("当前系统不支持原生文件选择器，请直接填写压缩包路径")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askopenfilename(title="选择 Minecraft 服务端压缩包",
+                                              filetypes=[("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")])
+        root.destroy()
+        return selected
+    except Exception as exc:
+        raise ValueError(f"无法打开文件选择器：{exc}") from exc
+
+
+def find_extracted_server_root(extraction_root: Path) -> Path:
+    best: tuple[int, int, Path] | None = None
+    for folder in [extraction_root, *[path for path in extraction_root.rglob("*") if path.is_dir()]]:
+        try:
+            depth = len(folder.relative_to(extraction_root).parts)
+        except ValueError:
+            continue
+        if depth > 5:
+            continue
+        score = 0
+        score += 60 if (folder / "server.properties").is_file() else 0
+        score += 35 if (folder / "eula.txt").is_file() else 0
+        score += 70 if any(folder.glob("libraries/net/minecraftforge/forge/*/win_args.txt")) else 0
+        score += 70 if any(folder.glob("libraries/net/neoforged/neoforge/*/win_args.txt")) else 0
+        score += 20 if any(folder.glob("*.jar")) else 0
+        score += 30 if any((folder / name).is_file() for name in
+                           ("run.bat", "start.bat", ".run.bat", "run.sh", "start.sh", ".run.sh")) else 0
+        if score and (best is None or (score, -depth) > (best[0], -best[1])):
+            best = (score, depth, folder)
+    if not best:
+        raise ValueError("解压完成，但没有找到服务端启动目录")
+    return best[2]
+
+
+def validate_import_request(payload: dict[str, Any]) -> dict[str, Any]:
+    inspection = inspect_server_archive(str(payload.get("archive_path", "")))
+    destination_text = str(payload.get("destination") or inspection["destination"]).strip().strip('"')
+    destination = Path(destination_text).expanduser().resolve()
+    if destination.exists():
+        raise FileExistsError(f"导入目录已存在，请更换目录：{destination}")
+    if destination == Path(destination.anchor) or len(destination.parts) < 2:
+        raise ValueError("导入目录不能是磁盘根目录")
+    xms = str(payload.get("xms") or "2G").upper()
+    xmx = str(payload.get("xmx") or "8G").upper()
+    validate_memory(xms, xmx)
+    launch_mode = str(payload.get("launch_mode") or "auto")
+    launch_target = str(payload.get("launch_target") or "")
+    if launch_mode not in {"auto", "forge_args", "jar", "script"}:
+        raise ValueError("启动方式无效")
+    if launch_target and not any(item["mode"] == launch_mode and item["target"] == launch_target
+                                 for item in inspection["launch_candidates"]):
+        raise ValueError("选择的启动文件不属于当前压缩包")
+    properties = validate_properties(payload.get("properties") or {})
+    return {
+        "inspection": inspection,
+        "destination": destination,
+        "name": str(payload.get("name") or inspection["name"]).strip()[:80],
+        "java": str(payload.get("java") or inspection["recommended_java"] or "java").strip(),
+        "xms": xms,
+        "xmx": xmx,
+        "launch_mode": launch_mode,
+        "launch_target": launch_target,
+        "properties": properties,
+        "accept_eula": bool(payload.get("accept_eula", False)),
+        "start_after_import": bool(payload.get("start_after_import", False)),
+    }
+
+
+def extract_archive_worker(request: dict[str, Any], job_id: str) -> None:
+    inspection = request["inspection"]
+    archive_path = Path(inspection["path"])
+    destination: Path = request["destination"]
+    parent = destination.parent
+    temporary = parent / f".lodestar-import-{job_id}"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        if temporary.exists():
+            raise FileExistsError(f"临时导入目录已存在：{temporary}")
+        temporary.mkdir()
+        total = max(1, int(inspection["expanded_size"]))
+        written = 0
+        set_job(job_id, state="running", progress=1, message="正在安全解压服务端…")
+        with zipfile.ZipFile(archive_path) as archive:
+            for index, info in enumerate(archive.infolist(), start=1):
+                name = normalized_archive_member(info)
+                target = (temporary / Path(*name.split("/"))).resolve()
+                try:
+                    target.relative_to(temporary.resolve())
+                except ValueError as exc:
+                    raise ValueError(f"压缩包路径越界：{name}") from exc
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as source, target.open("wb") as output:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        written += len(chunk)
+                        if written > MAX_ARCHIVE_EXPANDED_BYTES:
+                            raise ValueError("解压数据超过安全上限")
+                if index % 50 == 0:
+                    set_job(job_id, progress=min(88, max(2, int(written / total * 88))),
+                            message=f"正在解压 · {index:,}/{inspection['file_count']:,} 个文件")
+        os.replace(temporary, destination)
+        server_root = find_extracted_server_root(destination)
+        set_job(job_id, progress=91, message="正在写入开服配置…")
+        if request["properties"]:
+            write_properties(server_root, request["properties"])
+        if request["accept_eula"]:
+            eula_path = server_root / "eula.txt"
+            eula_path.write_text("eula=true\n", encoding="utf-8")
+        profile = register_server({
+            "path": str(server_root), "name": request["name"], "java": request["java"],
+            "xms": request["xms"], "xmx": request["xmx"],
+        })
+        updates: dict[str, Any] = {
+            "name": request["name"], "java": request["java"], "xms": request["xms"], "xmx": request["xmx"],
+            "launch_mode": request["launch_mode"], "launch_target": request["launch_target"],
+        }
+        update_profile({"server_id": profile["id"], "profile": updates})
+        message = "服务端已导入"
+        if request["start_after_import"]:
+            message = f"{message}；{start_server(get_profile(profile['id']))}"
+        set_job(job_id, state="done", progress=100, message=message, server_id=profile["id"],
+                profile=public_profile(get_profile(profile["id"])))
+    except Exception as exc:
+        if temporary.is_dir():
+            try:
+                shutil.rmtree(temporary)
+            except OSError:
+                pass
+        set_job(job_id, state="error", message=str(exc), error=str(exc))
+
+
+def start_archive_import(payload: dict[str, Any]) -> dict[str, Any]:
+    request = validate_import_request(payload)
+    job_id = uuid.uuid4().hex[:16]
+    job = {
+        "id": job_id,
+        "type": "archive_import",
+        "state": "queued",
+        "progress": 0,
+        "message": "等待导入…",
+        "created_at": now_iso(),
+        "server_id": None,
+        "archive": request["inspection"]["path"],
+        "destination": str(request["destination"]),
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    threading.Thread(target=extract_archive_worker, args=(request, job_id), daemon=True,
+                     name=f"lodestar-import-{job_id}").start()
+    return job
+
+
 def read_properties(root: Path) -> dict[str, str]:
     path = root / "server.properties"
     result: dict[str, str] = {}
@@ -378,9 +831,7 @@ def read_properties(root: Path) -> dict[str, str]:
 
 def write_properties(root: Path, changes: dict[str, str]) -> None:
     path = root / "server.properties"
-    if not path.exists():
-        raise FileNotFoundError(f"找不到配置文件：{path}")
-    original = path.read_text(encoding="utf-8", errors="replace")
+    original = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     pending = dict(changes)
     updated: list[str] = []
     for line in original.splitlines():
@@ -393,7 +844,8 @@ def write_properties(root: Path, changes: dict[str, str]) -> None:
     updated.extend(f"{key}={value}" for key, value in pending.items())
     panel_dir = root / ".ripple-panel"
     panel_dir.mkdir(exist_ok=True)
-    shutil.copy2(path, panel_dir / "server.properties.bak")
+    if path.exists():
+        shutil.copy2(path, panel_dir / "server.properties.bak")
     temporary = panel_dir / "server.properties.tmp"
     temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
     os.replace(temporary, path)
@@ -666,6 +1118,7 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
         }
     except OSError:
         storage = {"free_gb": None, "total_gb": None, "used_percent": None}
+    startup_failure = diagnose_startup_failure(root) if running and ping is None else None
     return {
         "running": running,
         "ready": ping is not None,
@@ -685,6 +1138,7 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
         "eula": eula_accepted(root),
         "storage": storage,
         "last_exit": LAST_EXITS.get(profile["id"]),
+        "startup_failure": startup_failure,
     }
 
 
@@ -898,7 +1352,7 @@ def start_server(profile: dict[str, Any]) -> str:
         DATA_ROOT.mkdir(parents=True, exist_ok=True)
         runtime_log = DATA_ROOT / f"runtime-{profile['id']}.log"
         log_handle = runtime_log.open("a", encoding="utf-8", errors="replace", buffering=1)
-        log_handle.write(f"\n[{now_iso()}] Ripple Panel 启动：{description}\n")
+        log_handle.write(f"\n[{now_iso()}] Lodestar 启动：{description}\n")
         creationflags = 0
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -974,7 +1428,12 @@ def read_tail(path: Path, max_bytes: int = 300_000) -> str:
         size = handle.tell()
         handle.seek(max(0, size - max_bytes))
         data = handle.read()
-    text = data.decode("utf-8", errors="replace")
+    # Most modern servers write UTF-8, while some Windows Forge packs inherit
+    # the system GBK code page. Preserve useful Chinese mod names in both cases.
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("gb18030", errors="replace")
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
 
 
@@ -985,6 +1444,12 @@ def combined_logs(profile: dict[str, Any]) -> dict[str, str]:
     if latest:
         return {"source": "logs/latest.log", "text": latest}
     return {"source": "面板运行日志", "text": runtime or "暂无日志。启动服务器后，这里会自动刷新。"}
+
+
+def validate_content_kind(kind: str) -> str:
+    if kind not in {"mods", "plugins"}:
+        raise ValueError("内容类型必须是 mods 或 plugins")
+    return kind
 
 
 def safe_mod_name(name: str) -> str:
@@ -1004,6 +1469,13 @@ def mod_metadata(path: Path) -> dict[str, str]:
                 data = json.loads(raw.decode("utf-8", errors="replace"))
                 result.update(display_name=str(data.get("name") or path.stem), mod_id=str(data.get("id") or ""),
                               version=str(data.get("version") or ""))
+            elif "plugin.yml" in names or "paper-plugin.yml" in names:
+                plugin_name = "paper-plugin.yml" if "paper-plugin.yml" in names else "plugin.yml"
+                text = archive.read(plugin_name)[:1_000_000].decode("utf-8", errors="replace")
+                for key, output in (("name", "display_name"), ("main", "mod_id"), ("version", "version")):
+                    match = re.search(rf"(?mi)^\s*{key}\s*:\s*[\"']?([^\r\n\"']+)", text)
+                    if match:
+                        result[output] = match.group(1).strip()
             else:
                 toml_name = "META-INF/neoforge.mods.toml" if "META-INF/neoforge.mods.toml" in names else "META-INF/mods.toml"
                 if toml_name in names:
@@ -1017,15 +1489,44 @@ def mod_metadata(path: Path) -> dict[str, str]:
     return result
 
 
-def list_mods(profile: dict[str, Any]) -> list[dict[str, Any]]:
-    root = Path(profile["path"])
-    locations = [
-        ("enabled", root / "mods"),
-        ("disabled", root / "disabled_mods"),
-        ("trash", root / ".ripple-panel" / "mod-trash"),
+def record_metric(profile: dict[str, Any], status: dict[str, Any]) -> None:
+    process = status.get("process") or {}
+    point = {
+        "at": now_iso(),
+        "running": bool(status.get("running")),
+        "ready": bool(status.get("ready")),
+        "cpu": round(float(process.get("cpu_percent") or 0), 2),
+        "memory_mb": round(float(process.get("memory_mb") or 0), 2),
+        "players": int((status.get("players") or {}).get("online") or 0),
+    }
+    with METRICS_LOCK:
+        history = METRIC_HISTORY.setdefault(profile["id"], [])
+        if history and history[-1]["at"] == point["at"] and history[-1]["running"] == point["running"]:
+            history[-1] = point
+        else:
+            history.append(point)
+        del history[:-720]
+
+
+def metric_history(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    with METRICS_LOCK:
+        return [dict(point) for point in METRIC_HISTORY.get(profile["id"], [])]
+
+
+def content_locations(root: Path, kind: str) -> list[tuple[str, Path]]:
+    kind = validate_content_kind(kind)
+    singular = "mod" if kind == "mods" else "plugin"
+    return [
+        ("enabled", root / kind),
+        ("disabled", root / f"disabled_{kind}"),
+        ("trash", root / ".ripple-panel" / f"{singular}-trash"),
     ]
+
+
+def list_mods(profile: dict[str, Any], kind: str = "mods") -> list[dict[str, Any]]:
+    root = Path(profile["path"])
     result: list[dict[str, Any]] = []
-    for state, folder in locations:
+    for state, folder in content_locations(root, kind):
         if not folder.is_dir():
             continue
         for path in sorted(folder.glob("*.jar"), key=lambda item: item.name.casefold()):
@@ -1040,13 +1541,9 @@ def list_mods(profile: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def mod_path(profile: dict[str, Any], state: str, name: str) -> Path:
+def mod_path(profile: dict[str, Any], state: str, name: str, kind: str = "mods") -> Path:
     root = Path(profile["path"])
-    folders = {
-        "enabled": root / "mods",
-        "disabled": root / "disabled_mods",
-        "trash": root / ".ripple-panel" / "mod-trash",
-    }
+    folders = dict(content_locations(root, kind))
     if state not in folders:
         raise ValueError("Mod 状态无效")
     path = folders[state] / safe_mod_name(name)
@@ -1064,20 +1561,23 @@ def unique_destination(folder: Path, name: str) -> Path:
     return folder / f"{stem}-{dt.datetime.now():%Y%m%d-%H%M%S}{suffix}"
 
 
-def change_mod_state(profile: dict[str, Any], action: str, state: str, name: str) -> str:
-    source = mod_path(profile, state, name)
+def change_mod_state(profile: dict[str, Any], action: str, state: str, name: str, kind: str = "mods") -> str:
+    kind = validate_content_kind(kind)
+    source = mod_path(profile, state, name, kind)
     root = Path(profile["path"])
+    disabled_folder = root / f"disabled_{kind}"
+    trash_folder = root / ".ripple-panel" / ("mod-trash" if kind == "mods" else "plugin-trash")
     if action == "enable":
-        destination = unique_destination(root / "mods", source.name)
+        destination = unique_destination(root / kind, source.name)
         label = "启用"
     elif action == "disable":
-        destination = unique_destination(root / "disabled_mods", source.name)
+        destination = unique_destination(disabled_folder, source.name)
         label = "停用"
     elif action == "remove":
-        destination = unique_destination(root / ".ripple-panel" / "mod-trash", source.name)
+        destination = unique_destination(trash_folder, source.name)
         label = "移入回收站"
     elif action == "restore":
-        destination = unique_destination(root / "disabled_mods", source.name)
+        destination = unique_destination(disabled_folder, source.name)
         label = "恢复为停用状态"
     else:
         raise ValueError("未知的 Mod 操作")
@@ -1085,15 +1585,16 @@ def change_mod_state(profile: dict[str, Any], action: str, state: str, name: str
     return f"已{label} {source.name}；运行中的服务器需要重启才会生效"
 
 
-def save_uploaded_mod(profile: dict[str, Any], name: str, stream: Any, length: int) -> str:
+def save_uploaded_mod(profile: dict[str, Any], name: str, stream: Any, length: int, kind: str = "mods") -> str:
+    kind = validate_content_kind(kind)
     name = safe_mod_name(name)
     if length <= 0 or length > MAX_MOD_BYTES:
         raise ValueError("Mod 文件为空或超过 2 GB 限制")
-    folder = Path(profile["path"]) / "mods"
+    folder = Path(profile["path"]) / kind
     folder.mkdir(exist_ok=True)
     destination = folder / name
     if destination.exists():
-        raise FileExistsError(f"mods 中已经存在 {name}")
+        raise FileExistsError(f"{kind} 中已经存在 {name}")
     temporary = folder / f".{name}.{uuid.uuid4().hex}.uploading"
     remaining = length
     try:
@@ -1111,6 +1612,153 @@ def save_uploaded_mod(profile: dict[str, Any], name: str, stream: Any, length: i
         if temporary.exists():
             temporary.unlink()
     return f"已添加 {name}；请确认它与服务端版本和加载器兼容，然后重启服务器"
+
+
+TEXT_FILE_NAMES = {"eula.txt", "ops.json", "whitelist.json", "banned-ips.json", "banned-players.json"}
+TEXT_FILE_SUFFIXES = {
+    ".txt", ".log", ".json", ".json5", ".properties", ".toml", ".yml", ".yaml", ".conf", ".cfg", ".ini",
+    ".xml", ".md", ".bat", ".cmd", ".sh", ".ps1", ".js", ".ts", ".java", ".mcmeta", ".snbt", ".lang",
+}
+
+
+def server_file_path(profile: dict[str, Any], relative: str, *, must_exist: bool = True) -> Path:
+    root = Path(profile["path"]).resolve()
+    value = unquote(str(relative or "")).strip().replace("\\", "/").strip("/")
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    if any(part == ".." or not SAFE_ARCHIVE_NAME.fullmatch(part) for part in parts):
+        raise ValueError("文件路径无效")
+    candidate = (root.joinpath(*parts)).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("文件路径超出服务端目录") from exc
+    if parts and parts[0].casefold() == ".ripple-panel":
+        raise ValueError("面板内部目录不能通过文件管理器访问")
+    if must_exist and not candidate.exists():
+        raise FileNotFoundError("文件或目录不存在")
+    return candidate
+
+
+def relative_server_path(root: Path, path: Path) -> str:
+    return path.relative_to(root.resolve()).as_posix()
+
+
+def list_server_files(profile: dict[str, Any], relative: str = "") -> dict[str, Any]:
+    root = Path(profile["path"]).resolve()
+    folder = server_file_path(profile, relative)
+    if not folder.is_dir():
+        raise ValueError("当前路径不是目录")
+    entries: list[dict[str, Any]] = []
+    for path in sorted(folder.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
+        if path.name == ".ripple-panel":
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append({
+            "name": path.name,
+            "path": relative_server_path(root, path),
+            "type": "directory" if path.is_dir() else "file",
+            "size": 0 if path.is_dir() else stat.st_size,
+            "modified": dt.datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+            "editable": path.is_file() and stat.st_size <= MAX_TEXT_FILE_BYTES
+                        and (path.name.casefold() in TEXT_FILE_NAMES or path.suffix.casefold() in TEXT_FILE_SUFFIXES),
+        })
+    current = relative_server_path(root, folder) if folder != root else ""
+    parent = Path(current).parent.as_posix() if current else ""
+    if parent == ".":
+        parent = ""
+    return {"path": current, "parent": parent, "entries": entries}
+
+
+def read_server_text_file(profile: dict[str, Any], relative: str) -> dict[str, Any]:
+    path = server_file_path(profile, relative)
+    if not path.is_file():
+        raise ValueError("当前路径不是文件")
+    if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+        raise ValueError("文件超过 4 MB，请下载后使用本地编辑器")
+    if path.name.casefold() not in TEXT_FILE_NAMES and path.suffix.casefold() not in TEXT_FILE_SUFFIXES:
+        raise ValueError("该文件类型不支持网页编辑")
+    return {"path": relative_server_path(Path(profile["path"]), path),
+            "content": path.read_text(encoding="utf-8", errors="replace"), "size": path.stat().st_size}
+
+
+def save_server_text_file(profile: dict[str, Any], relative: str, content: Any) -> str:
+    path = server_file_path(profile, relative)
+    if not path.is_file():
+        raise ValueError("当前路径不是文件")
+    if path.name.casefold() not in TEXT_FILE_NAMES and path.suffix.casefold() not in TEXT_FILE_SUFFIXES:
+        raise ValueError("该文件类型不支持网页编辑")
+    text = str(content)
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_TEXT_FILE_BYTES:
+        raise ValueError("文本内容超过 4 MB")
+    root = Path(profile["path"])
+    history = root / ".ripple-panel" / "file-history" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    history_file = history / path.relative_to(root)
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, history_file)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.saving")
+    temporary.write_bytes(encoded)
+    os.replace(temporary, path)
+    return f"已保存 {path.name}；修改前版本已进入文件历史"
+
+
+def file_manager_action(profile: dict[str, Any], action: str, relative: str, name: str = "") -> str:
+    root = Path(profile["path"]).resolve()
+    target = server_file_path(profile, relative)
+    if action == "mkdir":
+        folder_name = str(name).strip()
+        if not SAFE_ARCHIVE_NAME.fullmatch(folder_name) or folder_name in {".", ".."}:
+            raise ValueError("文件夹名称无效")
+        destination = target / folder_name
+        destination.mkdir(parents=False, exist_ok=False)
+        return f"已创建文件夹 {folder_name}"
+    if target == root:
+        raise ValueError("不能操作服务端根目录")
+    if action == "rename":
+        new_name = str(name).strip()
+        if not SAFE_ARCHIVE_NAME.fullmatch(new_name) or new_name in {".", ".."}:
+            raise ValueError("新名称无效")
+        destination = target.with_name(new_name)
+        if destination.exists():
+            raise FileExistsError("同名文件或目录已经存在")
+        target.rename(destination)
+        return f"已重命名为 {new_name}"
+    if action == "trash":
+        trash = root / ".ripple-panel" / "file-trash" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+        trash.mkdir(parents=True, exist_ok=False)
+        destination = trash / target.name
+        shutil.move(str(target), str(destination))
+        manifest = {"original_path": relative_server_path(root, target), "trashed_at": now_iso(), "stored": target.name}
+        (trash / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return f"已将 {target.name} 移入面板回收站"
+    raise ValueError("未知文件操作")
+
+
+def save_uploaded_file(profile: dict[str, Any], relative: str, stream: Any, length: int) -> str:
+    if length <= 0 or length > MAX_FILE_UPLOAD_BYTES:
+        raise ValueError("文件为空或超过 4 GB 限制")
+    destination = server_file_path(profile, relative, must_exist=False)
+    if destination.exists():
+        raise FileExistsError(f"目标位置已经存在 {destination.name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.uploading")
+    remaining = length
+    try:
+        with temporary.open("wb") as handle:
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ConnectionError("上传连接提前结束")
+                handle.write(chunk)
+                remaining -= len(chunk)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return f"已上传 {destination.name}"
 
 
 def read_json_list(path: Path) -> list[dict[str, Any]]:
@@ -1248,6 +1896,103 @@ def remove_backup(profile: dict[str, Any], name: str) -> str:
     trash = backup_folder(profile) / ".trash"
     shutil.move(str(source), str(unique_destination(trash, source.name)))
     return "备份已移入回收站"
+
+
+def validate_backup_name(profile: dict[str, Any], name: str) -> Path:
+    if Path(name).name != name or not SAFE_FILE.fullmatch(name) or not name.lower().endswith(".zip"):
+        raise ValueError("备份文件名无效")
+    path = backup_folder(profile) / name
+    if not path.is_file():
+        raise FileNotFoundError("找不到备份")
+    return path
+
+
+def restore_backup_worker(profile: dict[str, Any], name: str, job_id: str) -> None:
+    root = Path(profile["path"]).resolve()
+    backup = validate_backup_name(profile, name)
+    rollback = root / ".ripple-panel" / "restore-history" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    failed = root / ".ripple-panel" / "restore-failed" / job_id
+    moved: list[tuple[Path, Path]] = []
+    restored_top: set[str] = set()
+    try:
+        if server_is_running(profile)["running"]:
+            raise ValueError("恢复备份前必须先停止服务器")
+        set_job(job_id, state="running", progress=5, message="正在检查备份完整性…")
+        with zipfile.ZipFile(backup) as archive:
+            infos = archive.infolist()
+            if not infos:
+                raise ValueError("备份压缩包为空")
+            normalized: list[tuple[zipfile.ZipInfo, str]] = []
+            total = 0
+            for info in infos:
+                member = normalized_archive_member(info)
+                if archive_member_is_symlink(info):
+                    raise ValueError(f"备份包含不支持的符号链接：{member}")
+                if member.split("/", 1)[0].casefold() in {".ripple-panel", "panel-backups"}:
+                    continue
+                total += info.file_size
+                if total > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError("备份解压体积超过安全上限")
+                normalized.append((info, member))
+            top_names = sorted({member.split("/", 1)[0] for _, member in normalized})
+            if not top_names:
+                raise ValueError("备份中没有可恢复的世界或配置")
+            rollback.mkdir(parents=True, exist_ok=False)
+            for top_name in top_names:
+                existing = root / top_name
+                if existing.exists():
+                    saved = rollback / top_name
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(existing), str(saved))
+                    moved.append((saved, existing))
+            written = 0
+            for index, (info, member) in enumerate(normalized, start=1):
+                target = (root / Path(*member.split("/"))).resolve()
+                target.relative_to(root)
+                restored_top.add(member.split("/", 1)[0])
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                written += info.file_size
+                if index % 25 == 0:
+                    set_job(job_id, progress=min(94, 10 + int(written / max(1, total) * 84)),
+                            message=f"正在恢复 · {index:,}/{len(normalized):,} 个文件")
+        set_job(job_id, state="done", progress=100,
+                message=f"已恢复 {name}；恢复前文件保存在面板历史中")
+    except Exception as exc:
+        try:
+            failed.mkdir(parents=True, exist_ok=True)
+            for top_name in restored_top:
+                current = root / top_name
+                if current.exists():
+                    shutil.move(str(current), str(unique_destination(failed, current.name)))
+            for saved, original in reversed(moved):
+                if saved.exists() and not original.exists():
+                    shutil.move(str(saved), str(original))
+        except OSError:
+            pass
+        set_job(job_id, state="error", message=str(exc), error=str(exc))
+
+
+def start_backup_restore(profile: dict[str, Any], name: str) -> dict[str, Any]:
+    validate_backup_name(profile, name)
+    if server_is_running(profile)["running"]:
+        raise ValueError("恢复备份前必须先停止服务器")
+    with JOBS_LOCK:
+        existing = next((job for job in JOBS.values() if job.get("server_id") == profile["id"]
+                         and job.get("state") in {"queued", "running"}), None)
+        if existing:
+            raise ValueError("该服务端已有任务正在进行")
+        job_id = uuid.uuid4().hex[:12]
+        job = {"id": job_id, "server_id": profile["id"], "type": "restore", "state": "queued",
+               "progress": 0, "message": "恢复任务已排队", "created_at": now_iso(), "backup": name}
+        JOBS[job_id] = job
+    threading.Thread(target=restore_backup_worker, args=(profile.copy(), name, job_id), daemon=True,
+                     name=f"lodestar-restore-{job_id}").start()
+    return job
 
 
 def read_scheduler_state() -> dict[str, Any]:
@@ -1394,6 +2139,157 @@ def java_version_text(profile: dict[str, Any]) -> str:
         return "无法读取"
 
 
+def parsed_java_major(version_text: str) -> int | None:
+    match = re.search(r'version\s+["\'](\d+)(?:\.(\d+))?', version_text, re.I)
+    if not match:
+        return None
+    first, second = int(match.group(1)), int(match.group(2) or 0)
+    return second if first == 1 else first
+
+
+def required_java_major(game_version: str) -> int | None:
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", game_version or "")
+    if not match:
+        return None
+    minor, patch = int(match.group(2)), int(match.group(3) or 0)
+    if minor <= 16:
+        return 8
+    if minor == 17:
+        return 16
+    if minor < 20 or (minor == 20 and patch <= 4):
+        return 17
+    return 21
+
+
+def diagnose_startup_failure(root: Path, log_text: str | None = None) -> dict[str, Any] | None:
+    """Turn common Forge and Java startup failures into an actionable result."""
+    log_path = root / "logs" / "latest.log"
+    crash_folder = root / "crash-reports"
+    crash_path: Path | None = None
+    if crash_folder.is_dir():
+        reports = sorted(crash_folder.glob("*.txt"), key=lambda item: item.stat().st_mtime, reverse=True)
+        crash_path = reports[0] if reports else None
+    use_crash = bool(crash_path and (not log_path.exists() or crash_path.stat().st_mtime >= log_path.stat().st_mtime))
+    source = crash_path.name if use_crash and crash_path else "logs/latest.log"
+    text = read_tail(crash_path, 1_200_000) if use_crash and crash_path else (
+        log_text if log_text is not None else read_tail(log_path, 500_000)
+    )
+    clean = re.sub(r"§.", "", text)
+    if not clean:
+        return None
+
+    invalid_dist = re.search(
+        r"Attempted to load class\s+([^\s]+)\s+for invalid dist\s+DEDICATED_SERVER", clean, re.I
+    )
+    if invalid_dist:
+        before = clean[:invalid_dist.start()]
+        mod_matches = list(re.finditer(
+            r"(?m)^\s*([^\r\n()]+?)\s*\(([-\w.]+)\)\s+has failed to load correctly", before, re.I
+        ))
+        mod_name = mod_matches[-1].group(1).strip() if mod_matches else "某个 Mod"
+        mod_id = mod_matches[-1].group(2).strip() if mod_matches else "未知 ID"
+        return {
+            "severity": "error",
+            "code": "client_mod_on_server",
+            "title": "发现仅客户端可用的 Mod",
+            "detail": f"{mod_name}（{mod_id}）在专用服务端加载了客户端类 {invalid_dist.group(1)}。",
+            "suggestions": [
+                f"在 Mod 管理中停用 {mod_id}，然后重新启动",
+                "若这是整合包必需 Mod，请换用明确支持 Dedicated Server 的版本",
+                "客户端可以保留该 Mod；只需从服务端移除",
+            ],
+            "source": source,
+        }
+
+    if re.search(r"(?:Address already in use|Failed to bind to port|端口.*(?:占用|绑定失败))", clean, re.I):
+        return {
+            "severity": "error", "code": "port_in_use", "title": "监听端口已被占用",
+            "detail": "另一个程序正在使用 server-port，Minecraft 无法完成监听。",
+            "suggestions": ["停止占用该端口的旧服务端", "或在配置与启动中更换监听端口"], "source": source,
+        }
+    if re.search(r"(?:OutOfMemoryError|Java heap space|GC overhead limit exceeded)", clean, re.I):
+        return {
+            "severity": "error", "code": "out_of_memory", "title": "Java 内存不足",
+            "detail": "服务端在加载过程中耗尽了 JVM 堆内存。",
+            "suggestions": ["提高最大内存 Xmx", "检查是否有异常占用内存的 Mod 或区块"], "source": source,
+        }
+    if "UnsupportedClassVersionError" in clean:
+        return {
+            "severity": "error", "code": "java_too_old", "title": "Java 版本不兼容",
+            "detail": "当前 Java 版本低于服务端或 Mod 编译时要求的版本。",
+            "suggestions": ["Minecraft 1.18–1.20.4 通常使用 Java 17", "Minecraft 1.20.5+ 通常使用 Java 21"],
+            "source": source,
+        }
+    dependency = re.search(
+        r"(?:Missing or unsupported mandatory dependencies|Mod .+ requires .+|requires version)", clean, re.I
+    )
+    if dependency:
+        return {
+            "severity": "error", "code": "missing_dependency", "title": "Mod 依赖缺失或版本不匹配",
+            "detail": dependency.group(0)[:400],
+            "suggestions": ["根据崩溃报告补齐依赖 Mod", "确认 Minecraft、加载器和全部 Mod 版本一致"],
+            "source": source,
+        }
+    if re.search(r"(?:Failed to start the minecraft server|LoadingFailedException|\bFATAL\b)", clean, re.I):
+        caused = re.findall(r"(?m)^\s*(?:Caused by:|[\w.]+(?:Exception|Error):)\s*(.+)$", clean)
+        detail = caused[-1].strip()[:500] if caused else "日志确认服务端在启动阶段发生致命错误。"
+        return {
+            "severity": "error", "code": "startup_fatal", "title": "服务端启动失败", "detail": detail,
+            "suggestions": ["打开下方最新崩溃报告", "检查最近新增或更新的 Mod / 插件"], "source": source,
+        }
+    return None
+
+
+def preflight_data(profile: dict[str, Any]) -> dict[str, Any]:
+    root = Path(profile["path"])
+    detected = detect_launch(root)
+    properties = read_properties(root)
+    status = server_is_running(profile)
+    checks: list[dict[str, str]] = []
+
+    def add(level: str, title: str, detail: str) -> None:
+        checks.append({"level": level, "title": title, "detail": detail})
+
+    if root.is_dir():
+        add("ok", "服务端目录", str(root))
+    else:
+        add("error", "服务端目录不存在", str(root))
+    try:
+        _, description = build_launch(profile)
+        add("ok", "启动目标", description)
+    except Exception as exc:
+        add("error", "启动目标不可用", str(exc))
+    java_text = java_version_text(profile)
+    java_major = parsed_java_major(java_text)
+    needed = required_java_major(detected.get("version", ""))
+    if java_major is None:
+        add("error", "Java 无法运行", java_text)
+    elif needed and java_major < needed:
+        add("error", "Java 版本过低", f"Minecraft {detected.get('version')} 建议 Java {needed}+；当前 {java_major}")
+    else:
+        add("ok", "Java 运行时", java_text)
+    if eula_accepted(root):
+        add("ok", "Minecraft EULA", "已同意")
+    else:
+        add("error", "Minecraft EULA", "启动前需要明确同意")
+    port = int(properties.get("server-port", "25565") or 25565)
+    owner = find_listening_pid(port)
+    current_pid = (status.get("process") or {}).get("pid")
+    if owner and owner != current_pid:
+        add("error", "端口被占用", f"端口 {port} 正被 PID {owner} 使用")
+    else:
+        add("ok", "监听端口", f"{port} 可用" if not owner else f"{port} 由当前服务端监听")
+    if properties.get("online-mode", "true").casefold() == "false":
+        add("warning", "正版验证已关闭", "任何人都可伪造玩家名；建议配合白名单或登录插件")
+    if properties.get("white-list", "false").casefold() != "true":
+        add("warning", "白名单未启用", "公网映射时建议限制可加入的玩家")
+    storage = status.get("storage") or {}
+    if storage.get("free_gb") is not None and float(storage["free_gb"]) < 10:
+        add("warning", "磁盘空间偏低", f"剩余 {storage['free_gb']} GB")
+    return {"ready": not any(item["level"] == "error" for item in checks), "checks": checks,
+            "java_major": java_major, "required_java_major": needed, "port": port}
+
+
 def diagnostic_data(profile: dict[str, Any]) -> dict[str, Any]:
     root = Path(profile["path"])
     crash_folder = root / "crash-reports"
@@ -1423,10 +2319,14 @@ def diagnostic_data(profile: dict[str, Any]) -> dict[str, Any]:
         "mod_count": sum(1 for item in mods if item["state"] == "enabled"),
         "disabled_mod_count": sum(1 for item in mods if item["state"] == "disabled"),
         "crash_reports": crash_reports,
+        # Historical warnings may remain in latest.log after a later successful
+        # startup. A live ping is stronger evidence than an old stack trace.
+        "diagnosis": None if status.get("ready") else diagnose_startup_failure(root, log_text),
         "error_lines": error_lines[-80:],
         "latest_log_size_mb": round(log_path.stat().st_size / 1024 / 1024, 2) if log_path.exists() else 0,
         "last_exit": status.get("last_exit"),
         "storage": status.get("storage"),
+        "preflight": preflight_data(profile),
         "generated_at": now_iso(),
     }
 
@@ -1482,7 +2382,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
 
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "RippleServerPanel/2.3.1"
+    server_version = f"{APP_NAME}/{APP_VERSION}"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -1563,20 +2463,44 @@ class PanelHandler(BaseHTTPRequestHandler):
                 profiles = [public_profile(item) for item in settings["servers"]]
                 active = settings.get("active_server_id")
                 self._json({"ok": True, "data": {"servers": profiles, "active_server_id": active,
-                            "platform": sys.platform, "panel_version": "2.3.1"}})
+                            "platform": sys.platform, "panel_version": APP_VERSION,
+                            "java_runtimes": discover_java_runtimes(), "app_name": APP_NAME}})
                 return
             if path == "/api/status":
                 profile = self._profile_from_query(query)
                 data = server_is_running(profile)
+                record_metric(profile, data)
                 data["frp_running"] = frp_running()
                 data["profile"] = public_profile(profile)
                 self._json({"ok": True, "data": data})
+                return
+            if path == "/api/metrics":
+                self._json({"ok": True, "data": metric_history(self._profile_from_query(query))})
                 return
             if path == "/api/logs":
                 self._json({"ok": True, "data": combined_logs(self._profile_from_query(query))})
                 return
             if path == "/api/mods":
-                self._json({"ok": True, "data": list_mods(self._profile_from_query(query))})
+                kind = (query.get("kind") or ["mods"])[0]
+                self._json({"ok": True, "data": list_mods(self._profile_from_query(query), kind)})
+                return
+            if path == "/api/files":
+                profile = self._profile_from_query(query)
+                relative = (query.get("path") or [""])[0]
+                self._json({"ok": True, "data": list_server_files(profile, relative)})
+                return
+            if path == "/api/file/content":
+                profile = self._profile_from_query(query)
+                relative = (query.get("path") or [""])[0]
+                self._json({"ok": True, "data": read_server_text_file(profile, relative)})
+                return
+            if path == "/api/file/download":
+                profile = self._profile_from_query(query)
+                relative = (query.get("path") or [""])[0]
+                file_path = server_file_path(profile, relative)
+                if not file_path.is_file():
+                    raise ValueError("只能下载文件")
+                self._send_file(file_path, mimetypes.guess_type(file_path.name)[0] or "application/octet-stream", file_path.name)
                 return
             if path == "/api/config":
                 profile = self._profile_from_query(query)
@@ -1600,6 +2524,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/diagnostics":
                 self._json({"ok": True, "data": diagnostic_data(self._profile_from_query(query))})
+                return
+            if path == "/api/preflight":
+                self._json({"ok": True, "data": preflight_data(self._profile_from_query(query))})
                 return
             if path == "/api/crash-report/download":
                 profile = self._profile_from_query(query)
@@ -1647,11 +2574,24 @@ class PanelHandler(BaseHTTPRequestHandler):
             if path == "/api/mods/upload":
                 profile = get_profile(self.headers.get("X-Server-Id"))
                 length = int(self.headers.get("Content-Length", "0") or 0)
-                message = save_uploaded_mod(profile, self.headers.get("X-Filename", ""), self.rfile, length)
+                kind = self.headers.get("X-Content-Kind", "mods")
+                message = save_uploaded_mod(profile, self.headers.get("X-Filename", ""), self.rfile, length, kind)
+                self._json({"ok": True, "message": message})
+                return
+            if path == "/api/file/upload":
+                profile = get_profile(self.headers.get("X-Server-Id"))
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                message = save_uploaded_file(profile, self.headers.get("X-Relative-Path", ""), self.rfile, length)
                 self._json({"ok": True, "message": message})
                 return
             payload = self._read_json()
-            if path == "/api/servers/import":
+            if path == "/api/import/archive/pick":
+                result = {"path": pick_server_archive()}
+            elif path == "/api/import/archive/inspect":
+                result = {"data": inspect_server_archive(str(payload.get("path", "")))}
+            elif path == "/api/import/archive/execute":
+                result = {"message": "服务端导入任务已开始", "job": start_archive_import(payload)}
+            elif path == "/api/servers/import":
                 profile = register_server(payload)
                 result = {"message": "服务端已导入", "profile": public_profile(profile)}
             elif path == "/api/servers/select":
@@ -1696,7 +2636,15 @@ class PanelHandler(BaseHTTPRequestHandler):
                     result = {"message": "配置已保存；服务器运行中时需要重启才会生效"}
                 elif path == "/api/mods/action":
                     message = change_mod_state(profile, str(payload.get("action", "")),
-                                               str(payload.get("state", "")), str(payload.get("name", "")))
+                                               str(payload.get("state", "")), str(payload.get("name", "")),
+                                               str(payload.get("kind", "mods")))
+                    result = {"message": message}
+                elif path == "/api/file/save":
+                    message = save_server_text_file(profile, str(payload.get("path", "")), payload.get("content", ""))
+                    result = {"message": message}
+                elif path == "/api/file/action":
+                    message = file_manager_action(profile, str(payload.get("action", "")),
+                                                  str(payload.get("path", "")), str(payload.get("name", "")))
                     result = {"message": message}
                 elif path == "/api/player":
                     message = player_action(profile, str(payload.get("action", "")), str(payload.get("name", "")),
@@ -1706,6 +2654,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     action = str(payload.get("action", ""))
                     if action == "create":
                         result = {"message": "备份已开始", "job": start_backup(profile)}
+                    elif action == "restore":
+                        result = {"message": "备份恢复已开始", "job": start_backup_restore(profile, str(payload.get("name", "")))}
                     elif action == "remove":
                         result = {"message": remove_backup(profile, str(payload.get("name", "")))}
                     else:
@@ -1725,7 +2675,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ripple Server Panel · 本地 Minecraft 服务端管理面板")
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} · 本地 Minecraft 服务端工作台")
     parser.add_argument("--no-browser", action="store_true", help="启动时不自动打开浏览器")
     parser.add_argument("--send-console", nargs=2, metavar=("PID", "COMMAND"), help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1745,10 +2695,10 @@ def main() -> None:
             print(f"面板已经在运行：http://{HOST}:{PORT}")
             return
         raise
-    threading.Thread(target=scheduler_loop, daemon=True, name="ripple-scheduler").start()
+    threading.Thread(target=scheduler_loop, daemon=True, name="lodestar-scheduler").start()
     if not args.no_browser:
         threading.Timer(0.7, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
-    print(f"Ripple Server Panel 已启动：http://{HOST}:{PORT}")
+    print(f"{APP_NAME} 已启动：http://{HOST}:{PORT}")
     print("关闭此窗口只会关闭管理面板，不会强制关闭 Minecraft 服务器。")
     try:
         httpd.serve_forever()

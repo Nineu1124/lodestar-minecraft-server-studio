@@ -141,6 +141,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .status-pill.online i { background: var(--green); box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 18%, transparent); }
 .status-pill.starting { background: var(--accent-soft); color: var(--accent); }
 .status-pill.starting i { background: var(--accent); animation: pulse 1.2s infinite; }
+.status-pill.error { background: var(--red-soft); color: var(--red); }
+.status-pill.error i { background: var(--red); box-shadow: 0 0 0 4px color-mix(in srgb, var(--red) 16%, transparent); }
 
 .theme-toggle .moon { display: none; }
 html[data-theme="dark"] .theme-toggle .moon { display: inline; }
