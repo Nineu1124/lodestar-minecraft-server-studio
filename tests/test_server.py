@@ -1,10 +1,12 @@
 import json
+import hashlib
 import shutil
 import sys
 import unittest
 import uuid
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import server
 
@@ -232,6 +234,10 @@ class LodestarPanelTests(unittest.TestCase):
         with zipfile.ZipFile(backup, "w") as archive:
             archive.write(world / "level.dat", "world/level.dat")
             archive.writestr("server.properties", "server-port=25573\nlevel-name=world\n")
+        with zipfile.ZipFile(backup, "a") as archive:
+            entries = [{"path": info.filename, "size": info.file_size,
+                        "sha256": hashlib.sha256(archive.read(info.filename)).hexdigest()} for info in archive.infolist()]
+            archive.writestr(server.BACKUP_MANIFEST, json.dumps({"format": 1, "complete": True, "worlds": ["world"], "files": entries}))
         (world / "level.dat").write_text("current-version", encoding="utf-8")
         job_id = "restore-test"
         server.JOBS[job_id] = {"id": job_id, "server_id": profile["id"], "type": "restore", "state": "queued"}
@@ -288,6 +294,51 @@ class LodestarPanelTests(unittest.TestCase):
         self.assertEqual(diagnosis["code"], "client_mod_on_server")
         self.assertIn("rs_crafting_stations", diagnosis["detail"])
         self.assertIn("rs工作台拓展", diagnosis["detail"])
+
+    def test_diagnostics_ignore_tolerated_client_class_noise(self):
+        log = (
+            "[main/ERROR] Attempted to load class net/minecraft/client/gui/screens/Screen "
+            "for invalid dist DEDICATED_SERVER\n"
+            "[main/INFO] Continuing normal startup\n"
+        )
+        self.assertIsNone(server.diagnose_startup_failure(self.root, log))
+
+    def test_running_process_is_not_marked_failed_before_port_is_ready(self):
+        profile = {**self.profile(), "id": "starting-server"}
+        process = type("Process", (), {"pid": 12345})()
+        with (
+            patch.object(server, "minecraft_ping", return_value=None),
+            patch.object(server, "runtime_for", return_value={"process": process}),
+            patch.object(server, "find_listening_pid", return_value=None),
+            patch.object(server, "process_info", return_value={"pid": 12345}),
+            patch.object(server, "diagnose_startup_failure") as diagnose,
+        ):
+            status = server.server_is_running(profile)
+        self.assertTrue(status["running"])
+        self.assertFalse(status["ready"])
+        self.assertIsNone(status["startup_failure"])
+        diagnose.assert_not_called()
+
+    def test_nonzero_process_exit_is_reported_as_startup_failure(self):
+        profile = {**self.profile(), "id": "failed-server"}
+        diagnosis = {
+            "severity": "error", "code": "startup_fatal", "title": "服务端启动失败",
+            "detail": "example", "suggestions": [], "source": "logs/latest.log",
+        }
+        server.LAST_EXITS[profile["id"]] = {"code": 1, "at": "2026-08-24T18:30:00+08:00"}
+        try:
+            with (
+                patch.object(server, "minecraft_ping", return_value=None),
+                patch.object(server, "runtime_for", return_value=None),
+                patch.object(server, "find_listening_pid", return_value=None),
+                patch.object(server, "process_info", return_value=None),
+                patch.object(server, "diagnose_startup_failure", return_value=diagnosis),
+            ):
+                status = server.server_is_running(profile)
+        finally:
+            server.LAST_EXITS.pop(profile["id"], None)
+        self.assertFalse(status["running"])
+        self.assertEqual(status["startup_failure"]["code"], "startup_fatal")
 
     def test_read_tail_falls_back_to_gb18030(self):
         path = self.root / "legacy.log"

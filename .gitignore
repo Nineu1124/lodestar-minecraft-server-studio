@@ -8,6 +8,8 @@ Thumbs.db
 tests/.tmp/
 tests/.test-work/
 tests/pyprobe/
+.pytest_cache/
+pytest-cache-files-*/
 
 # 本机实例、运行日志和临时数据
 data/*

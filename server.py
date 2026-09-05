@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import mimetypes
 import os
 import re
 import shutil
+import shlex
 import socket
 import struct
 import subprocess
@@ -18,11 +20,14 @@ import uuid
 import webbrowser
 import zipfile
 from collections import defaultdict
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+import server_bootstrap as bootstrapper
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -31,7 +36,7 @@ DATA_ROOT = APP_ROOT / "data"
 SETTINGS_PATH = DATA_ROOT / "settings.json"
 SCHEDULER_STATE_PATH = DATA_ROOT / "scheduler-state.json"
 APP_NAME = "Lodestar"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 HOST = os.environ.get("LODESTAR_PANEL_HOST", os.environ.get("RIPPLE_PANEL_HOST", "127.0.0.1"))
 PORT = int(os.environ.get("LODESTAR_PANEL_PORT", os.environ.get("RIPPLE_PANEL_PORT", "8765")))
 MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -42,7 +47,8 @@ MAX_ARCHIVE_FILES = 200_000
 MAX_ARCHIVE_EXPANDED_BYTES = 80 * 1024 * 1024 * 1024
 
 CONFIG_LOCK = threading.RLock()
-ACTION_LOCKS: dict[str, threading.Lock] = {}
+ACTION_LOCKS: dict[str, Any] = {}
+OPERATIONS: dict[str, str] = {}
 RUNTIME_LOCK = threading.RLock()
 RUNTIMES: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.RLock()
@@ -52,6 +58,8 @@ CPU_SAMPLES: dict[int, tuple[float, int]] = {}
 METRIC_HISTORY: dict[str, list[dict[str, Any]]] = {}
 SCHEDULER_LOCK = threading.RLock()
 LAST_EXITS: dict[str, dict[str, Any]] = {}
+BACKUP_MANIFEST = ".lodestar-backup.json"
+BACKUP_EXTRAS = {"server.properties", "whitelist.json", "ops.json", "banned-players.json", "banned-ips.json"}
 
 ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 ALLOWED_ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
@@ -139,6 +147,7 @@ def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "xmx": profile.get("xmx", "6G"),
         "launch_mode": profile.get("launch_mode", "auto"),
         "launch_target": profile.get("launch_target", ""),
+        "auto_setup": bool(profile.get("auto_setup", True)),
         "external_address": profile.get("external_address", ""),
         "auto_backup_keep": int(profile.get("auto_backup_keep", 10)),
         "backup_schedule_enabled": bool(profile.get("backup_schedule_enabled", False)),
@@ -156,9 +165,17 @@ def get_profile(server_id: str | None = None) -> dict[str, Any]:
     for profile in settings["servers"]:
         if profile.get("id") == wanted:
             return profile
+    if server_id:
+        raise FileNotFoundError("该实例不存在或已被移除，请刷新实例列表")
     if settings["servers"]:
         return settings["servers"][0]
     raise ValueError("还没有导入服务端，请先点击“导入服务端”")
+
+
+def require_profile(server_id: Any) -> dict[str, Any]:
+    if not isinstance(server_id, str) or not server_id.strip():
+        raise ValueError("修改操作必须明确指定实例 ID")
+    return get_profile(server_id)
 
 
 def ensure_server_folder(path_text: str) -> Path:
@@ -169,6 +186,7 @@ def ensure_server_folder(path_text: str) -> Path:
         raise ValueError(f"服务端文件夹不存在：{root}")
     markers = [root / "server.properties", root / "eula.txt"]
     has_launch = any(root.glob("*.jar")) or any(root.glob("*.bat")) or any(root.glob("*.sh"))
+    has_launch = has_launch or bootstrapper.folder_plan(root).get("supported", False)
     if not any(path.exists() for path in markers) and not has_launch:
         raise ValueError("这个文件夹不像 Minecraft 服务端：未找到配置、JAR 或启动脚本")
     return root
@@ -195,6 +213,7 @@ def register_server(payload: dict[str, Any]) -> dict[str, Any]:
         "xmx": xmx,
         "launch_mode": "auto",
         "launch_target": "",
+        "auto_setup": bool(payload.get("auto_setup", True)),
         "external_address": str(payload.get("external_address") or "").strip()[:200],
         "auto_backup_keep": 10,
         "backup_schedule_enabled": False,
@@ -221,6 +240,7 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "xmx",
         "launch_mode",
         "launch_target",
+        "auto_setup",
         "external_address",
         "auto_backup_keep",
         "backup_schedule_enabled",
@@ -230,7 +250,7 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if set(updates) - allowed:
         raise ValueError("启动配置中包含不允许的字段")
-    for boolean_key in ("backup_schedule_enabled", "restart_schedule_enabled"):
+    for boolean_key in ("backup_schedule_enabled", "restart_schedule_enabled", "auto_setup"):
         if boolean_key in updates and not isinstance(updates[boolean_key], bool):
             raise ValueError(f"{boolean_key} 必须是布尔值")
     settings = read_settings()
@@ -351,6 +371,8 @@ def detect_launch(root: Path) -> dict[str, Any]:
     )
     for jar in jar_order:
         lower = jar.name.lower()
+        if "installer" in lower:
+            continue
         label = jar.name
         candidates.append({"mode": "jar", "target": jar.name, "label": label})
         if result["mode"] == "none":
@@ -370,6 +392,15 @@ def detect_launch(root: Path) -> dict[str, Any]:
     if result["mode"] == "none" and candidates:
         result.update(mode=candidates[0]["mode"], target=candidates[0]["target"])
     result["candidates"] = candidates
+    plan = bootstrapper.folder_plan(root)
+    if plan.get("supported"):
+        result.update(loader=plan["loader"], version=plan["game_version"], bootstrap=plan)
+        if plan["needs_install"]:
+            result.update(mode="auto", target="")
+        else:
+            result.update(mode=plan["launch_mode"], target=plan["launch_target"])
+            if not any(c["target"] == plan["launch_target"] for c in candidates):
+                candidates.insert(0, {"mode": plan["launch_mode"], "target": plan["launch_target"], "label": "整合包启动目标"})
     return result
 
 
@@ -403,7 +434,7 @@ def discover_java_runtimes() -> list[dict[str, str]]:
     return unique
 
 
-def recommended_java(game_version: str, runtimes: list[dict[str, str]] | None = None) -> str:
+def recommended_java(game_version: str, runtimes: list[dict[str, str]] | None = None, major: int | None = None) -> str:
     runtimes = runtimes or discover_java_runtimes()
     if not runtimes:
         return shutil.which("java") or "java"
@@ -416,14 +447,16 @@ def recommended_java(game_version: str, runtimes: list[dict[str, str]] | None = 
             wanted = 8
         elif minor > 20 or (minor == 20 and patch >= 5):
             wanted = 21
+    wanted = major or wanted
     hints = {
         8: ("java-runtime-legacy", "jre-legacy", "jdk8", "java8"),
+        16: ("java-runtime-alpha", "jdk16", "java16"),
         17: ("java-runtime-beta", "java-runtime-gamma", "jdk17", "java17"),
         21: ("java-runtime-delta", "java-runtime-gamma", "jdk21", "java21"),
     }
     for runtime in runtimes:
         lower = runtime["path"].casefold()
-        if any(hint in lower for hint in hints[wanted]):
+        if any(hint in lower for hint in hints.get(wanted, ())):
             return runtime["path"]
     return runtimes[0]["path"]
 
@@ -474,6 +507,8 @@ def archive_layout(names: list[str], script_contents: dict[str, str] | None = No
         parts = name.split("/")
         base = parts[-1].casefold()
         parent = "/".join(parts[:-1])
+        if "mods" in parts[:-1]:
+            mark("/".join(parts[:parts.index("mods")]), 1, "mods")
         if base == "server.properties":
             mark(parent, 60, "server.properties")
         elif base == "eula.txt":
@@ -513,7 +548,7 @@ def archive_layout(names: list[str], script_contents: dict[str, str] | None = No
         relative = forge_matches[0][len(prefix):]
         label = "NeoForge 参数文件" if "neoforged" in relative.casefold() else "Forge 参数文件"
         candidates.append({"mode": "forge_args", "target": relative, "label": label})
-    jar_files = sorted([name for name in direct_files if name.casefold().endswith(".jar")], key=str.casefold)
+    jar_files = sorted([name for name in direct_files if name.casefold().endswith(".jar") and "installer" not in name.casefold()], key=str.casefold)
     for name in jar_files:
         candidates.append({"mode": "jar", "target": name, "label": name})
     preferred_scripts = ("run.bat", "start.bat", "serverstart.bat", "startserver.bat", ".run.bat",
@@ -578,6 +613,14 @@ def archive_layout(names: list[str], script_contents: dict[str, str] | None = No
         elif jar_files:
             loader = "vanilla"
 
+    relative_files = [name[len(prefix):] for name in files if name.startswith(prefix)]
+    relative_texts = {name[len(prefix):]: value for name, value in script_contents.items() if name.startswith(prefix)}
+    plan = bootstrapper.recognize(relative_files, relative_texts)
+    if plan.get("supported"):
+        loader, version = plan["loader"], plan["game_version"]
+        recommended = {"mode": "auto", "target": "", "label": "一键准备并启动（推荐）"}
+        candidates.insert(0, recommended)
+        recommendation_reason = f"自动准备 {loader}，使用 Java {plan['java_major']}，保留整合包必要参数"
     return {
         "root": selected,
         "root_candidates": [
@@ -589,6 +632,7 @@ def archive_layout(names: list[str], script_contents: dict[str, str] | None = No
         "launch_candidates": candidates,
         "recommended_launch": recommended,
         "recommendation_reason": recommendation_reason,
+        "bootstrap": plan,
         "has_properties": f"{prefix}server.properties".casefold() in lower_names,
         "has_eula": f"{prefix}eula.txt".casefold() in lower_names,
         "has_world": any(name.startswith(f"{prefix}world/") for name in files),
@@ -620,13 +664,20 @@ def inspect_server_archive(path_text: str) -> dict[str, Any]:
                 raise ValueError("压缩包解压后的体积超过 80 GB 安全上限")
             names.append(name + ("/" if info.is_dir() and not name.endswith("/") else ""))
             if (not info.is_dir() and info.file_size <= 256_000
-                    and Path(name).suffix.casefold() in {".bat", ".cmd", ".sh"}):
+                    and (Path(name).suffix.casefold() in {".bat", ".cmd", ".sh"}
+                         or Path(name).name in {"variables.txt", bootstrapper.MARKER})):
                 script_contents[name] = archive.read(info).decode("utf-8", errors="replace")
     if encrypted:
         raise ValueError("暂不支持带密码的服务端压缩包")
     layout = archive_layout(names, script_contents)
     if not layout["launch_candidates"]:
-        raise ValueError("没有在压缩包中找到可用的服务端 JAR、Forge 参数文件或启动脚本")
+        known = bootstrapper.KNOWN_ARCHIVES.get(bootstrapper.digest_file(path))
+        if known:
+            prefix = layout["root"] + "/" if layout["root"] else ""
+            script_contents[prefix + bootstrapper.MARKER] = json.dumps(known)
+            layout = archive_layout(names, script_contents)
+    if not layout["launch_candidates"]:
+        raise ValueError("缺少可靠的服务端核心或加载器版本。请使用作者服务端包；纯客户端整合包暂不能保证自动转换。")
     archive_parent_name = path.parent.name.casefold()
     import_parent = path.parent.parent if ("压缩包" in archive_parent_name or archive_parent_name in {"archives", "packages"}) else path.parent
     default_destination = import_parent / path.stem
@@ -647,7 +698,7 @@ def inspect_server_archive(path_text: str) -> dict[str, Any]:
         "destination": str(default_destination),
         **layout,
         "java_runtimes": runtimes,
-        "recommended_java": recommended_java(layout["version"], runtimes),
+        "recommended_java": recommended_java(layout["version"], runtimes, layout.get("bootstrap", {}).get("java_major")),
         "warnings": warnings,
     }
 
@@ -679,6 +730,7 @@ def find_extracted_server_root(extraction_root: Path) -> Path:
         if depth > 5:
             continue
         score = 0
+        score += 50 if (folder / "mods").is_dir() and (folder / "config").is_dir() else 0
         score += 60 if (folder / "server.properties").is_file() else 0
         score += 35 if (folder / "eula.txt").is_file() else 0
         score += 70 if any(folder.glob("libraries/net/minecraftforge/forge/*/win_args.txt")) else 0
@@ -694,6 +746,10 @@ def find_extracted_server_root(extraction_root: Path) -> Path:
 
 
 def validate_import_request(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("start_after_import") and payload.get("accept_eula") is not True:
+        raise ValueError("一键开服前需要明确同意 Minecraft EULA")
+    if payload.get("start_after_import") and payload.get("trust_pack") is not True:
+        raise ValueError("请确认信任此整合包，并允许下载官方核心和便携 Java")
     inspection = inspect_server_archive(str(payload.get("archive_path", "")))
     destination_text = str(payload.get("destination") or inspection["destination"]).strip().strip('"')
     destination = Path(destination_text).expanduser().resolve()
@@ -724,6 +780,7 @@ def validate_import_request(payload: dict[str, Any]) -> dict[str, Any]:
         "properties": properties,
         "accept_eula": bool(payload.get("accept_eula", False)),
         "start_after_import": bool(payload.get("start_after_import", False)),
+        "auto_setup": bool(payload.get("auto_setup", True)),
     }
 
 
@@ -739,11 +796,16 @@ def extract_archive_worker(request: dict[str, Any], job_id: str) -> None:
             raise FileExistsError(f"临时导入目录已存在：{temporary}")
         temporary.mkdir()
         total = max(1, int(inspection["expanded_size"]))
+        if shutil.disk_usage(parent).free < total + 1024**3:
+            raise RuntimeError("磁盘空间不足：解压后需至少保留 1 GB 空间")
         written = 0
         set_job(job_id, state="running", progress=1, message="正在安全解压服务端…")
         with zipfile.ZipFile(archive_path) as archive:
             for index, info in enumerate(archive.infolist(), start=1):
+                check_start_cancelled(job_id)
                 name = normalized_archive_member(info)
+                if archive_member_is_symlink(info) or info.flag_bits & 1:
+                    raise ValueError("压缩包已改变或包含不安全条目")
                 target = (temporary / Path(*name.split("/"))).resolve()
                 try:
                     target.relative_to(temporary.resolve())
@@ -767,6 +829,11 @@ def extract_archive_worker(request: dict[str, Any], job_id: str) -> None:
                             message=f"正在解压 · {index:,}/{inspection['file_count']:,} 个文件")
         os.replace(temporary, destination)
         server_root = find_extracted_server_root(destination)
+        plan = inspection.get("bootstrap", {})
+        if plan.get("supported") and plan.get("loader_version"):
+            marker = server_root / bootstrapper.MARKER
+            if not marker.exists():
+                marker.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         set_job(job_id, progress=91, message="正在写入开服配置…")
         if request["properties"]:
             write_properties(server_root, request["properties"])
@@ -780,11 +847,13 @@ def extract_archive_worker(request: dict[str, Any], job_id: str) -> None:
         updates: dict[str, Any] = {
             "name": request["name"], "java": request["java"], "xms": request["xms"], "xmx": request["xmx"],
             "launch_mode": request["launch_mode"], "launch_target": request["launch_target"],
+            "auto_setup": request["auto_setup"],
         }
         update_profile({"server_id": profile["id"], "profile": updates})
+        set_job(job_id, server_id=profile["id"])
         message = "服务端已导入"
         if request["start_after_import"]:
-            message = f"{message}；{start_server(get_profile(profile['id']))}"
+            message = perform_one_click(get_profile(profile["id"]), job_id)
         set_job(job_id, state="done", progress=100, message=message, server_id=profile["id"],
                 profile=public_profile(get_profile(profile["id"])))
     except Exception as exc:
@@ -811,9 +880,129 @@ def start_archive_import(payload: dict[str, Any]) -> dict[str, Any]:
         "destination": str(request["destination"]),
     }
     with JOBS_LOCK:
+        reserve_destination(request["destination"])
         JOBS[job_id] = job
     threading.Thread(target=extract_archive_worker, args=(request, job_id), daemon=True,
                      name=f"lodestar-import-{job_id}").start()
+    return job
+
+
+def reserve_destination(destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError("目标目录已存在；失败的已导入实例请直接点一键开服重试")
+    if any(j.get("destination") == str(destination) and j.get("state") in {"queued", "running"} for j in JOBS.values()):
+        raise RuntimeError("此目录已有导入任务，请等待完成")
+
+
+def check_start_cancelled(job_id: str) -> None:
+    with JOBS_LOCK:
+        if JOBS.get(job_id, {}).get("cancel_requested"):
+            raise bootstrapper.Cancelled("已取消一键开服；已下载文件保留，未删除世界")
+
+
+def perform_one_click(profile: dict[str, Any], job_id: str) -> str:
+    started_here = False
+    def progress(message):
+        check_start_cancelled(job_id)
+        set_job(job_id, state="running", progress=93, message=message, phase="preparing")
+    try:
+        progress("检查端口、EULA、Java 和整合包启动方案…")
+        was_running = server_is_running(profile)["running"]
+        start_server(profile, job_id, progress)
+        started_here = not was_running and runtime_for(profile["id"]) is not None
+        set_job(job_id, phase="loading", progress=96, message="核心准备完成，等待模组和世界加载…")
+        deadline, ready_count = time.monotonic() + 900, 0
+        while time.monotonic() < deadline:
+            check_start_cancelled(job_id)
+            status = server_is_running(get_profile(profile["id"]))
+            if not status["running"]:
+                detail = (status.get("startup_failure") or {}).get("detail", "请查看控制台和安装日志")
+                raise RuntimeError(f"服务端在就绪前退出：{detail}")
+            ready_count = ready_count + 1 if status["ready"] else 0
+            if ready_count >= 2:
+                return "一键开服完成：已确认游戏服务就绪"
+            time.sleep(2)
+        raise TimeoutError("15 分钟内未确认游戏服务就绪，请查看控制台")
+    except Exception as exc:
+        if started_here and runtime_for(profile["id"]):
+            try:
+                stop_server(profile, job_id)
+            except Exception as stop_error:
+                raise RuntimeError(f"{exc}；正常停服未完成：{stop_error}。未强制结束，请在控制台处理。") from exc
+        raise
+
+
+def one_click_worker(profile: dict[str, Any], job_id: str) -> None:
+    try:
+        message = perform_one_click(profile, job_id)
+        set_job(job_id, state="done", progress=100, message=message)
+    except Exception as exc:
+        set_job(job_id, state="error", message=str(exc), error=str(exc))
+
+
+def start_one_click(profile: dict[str, Any]) -> dict[str, Any]:
+    if not eula_accepted(Path(profile["path"])):
+        raise ValueError("尚未同意 Minecraft EULA，请先在启动配置中勾选同意")
+    with JOBS_LOCK:
+        if active_server_job(profile["id"]):
+            raise RuntimeError("此实例已有任务，请等待或取消后重试")
+        job_id = uuid.uuid4().hex[:16]
+        job = {"id": job_id, "type": "start", "server_id": profile["id"], "state": "queued",
+               "progress": 0, "phase": "preparing", "message": "等待一键开服…", "created_at": now_iso()}
+        JOBS[job_id] = job
+    threading.Thread(target=one_click_worker, args=(profile.copy(), job_id), daemon=True).start()
+    return job
+
+
+def cancel_start_job(job_id: str) -> str:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.get("type") not in {"start", "archive_import", "ftb_import"}:
+            raise ValueError("不是可取消的开服任务")
+        if job.get("state") not in {"queued", "running"}:
+            return "任务已结束"
+        job["cancel_requested"] = True
+        job["message"] = "正在取消；若游戏服已启动，将尝试正常保存并停服…"
+    return "已请求取消；保留已下载文件供下次重试"
+
+
+def start_ftb_import(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("accept_eula") is not True or payload.get("trust_pack") is not True:
+        raise ValueError("请明确同意 EULA 并确认信任此整合包和官方依赖下载")
+    pack_id = int(payload.get("pack_id", 0))
+    version_id = int(payload["version_id"]) if str(payload.get("version_id") or "").strip() else None
+    if not 1 <= pack_id <= 10_000_000 or (version_id is not None and not 1 <= version_id <= 100_000_000):
+        raise ValueError("FTB 项目/版本 ID 无效")
+    raw = str(payload.get("destination") or "").strip().strip('"')
+    if not raw:
+        raise ValueError("请选择新的服务端目录")
+    destination = Path(raw).expanduser().resolve()
+    if destination == Path(destination.anchor):
+        raise ValueError("不能使用磁盘根目录")
+    xms, xmx = str(payload.get("xms") or "1G").upper(), str(payload.get("xmx") or "6G").upper()
+    validate_memory(xms, xmx)
+    properties = validate_properties(payload.get("properties") or {"online-mode": True})
+    with JOBS_LOCK:
+        reserve_destination(destination)
+        job_id = uuid.uuid4().hex[:16]
+        job = {"id": job_id, "type": "ftb_import", "server_id": None, "state": "queued", "progress": 0,
+               "destination": str(destination), "message": "读取 FTB 官方发布版本…", "created_at": now_iso()}
+        JOBS[job_id] = job
+    def worker():
+        try:
+            manifest = bootstrapper.ftb_manifest(pack_id, version_id)
+            check_start_cancelled(job_id)
+            destination.mkdir(parents=True, exist_ok=False)
+            (destination / bootstrapper.FTB_SOURCE).write_text(json.dumps({"pack_id": pack_id, "version_id": manifest["id"], "complete": False}), encoding="utf-8")
+            write_properties(destination, properties)
+            (destination / "eula.txt").write_text("eula=true\n", encoding="utf-8")
+            profile = register_server({"path": str(destination), "name": str(payload.get("name") or f"FTB {pack_id} · {manifest['name']}"), "xms": xms, "xmx": xmx, "auto_setup": True})
+            set_job(job_id, server_id=profile["id"], state="running")
+            message = perform_one_click(profile, job_id)
+            set_job(job_id, state="done", progress=100, message=message)
+        except Exception as exc:
+            set_job(job_id, state="error", error=str(exc), message=str(exc))
+    threading.Thread(target=worker, daemon=True, name=f"lodestar-ftb-{job_id}").start()
     return job
 
 
@@ -932,7 +1121,7 @@ def filetime_ticks(value: FILETIME) -> int:
     return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
 
 
-def windows_process_snapshot() -> dict[int, str]:
+def windows_process_snapshot(parents: bool = False) -> dict[int, Any]:
     if os.name != "nt":
         return {}
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -953,12 +1142,93 @@ def windows_process_snapshot() -> dict[int, str]:
         entry.dwSize = ctypes.sizeof(entry)
         if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
             while True:
-                result[int(entry.th32ProcessID)] = entry.szExeFile
+                result[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID) if parents else entry.szExeFile
                 if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                     break
     finally:
         kernel32.CloseHandle(snapshot)
     return result
+
+
+def process_identity(pid: int) -> str | None:
+    """A PID alone is not an identity: include its OS creation token."""
+    try:
+        if os.name != "nt":
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            return f"{boot}:{fields[19]}"
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(FILETIME)] * 4
+        handle = kernel32.OpenProcess(0x1000, 0, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                if filetime_ticks(exited):
+                    return None
+                return str(filetime_ticks(created))
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def owned_process_pid(profile: dict[str, Any], runtime: dict[str, Any] | None) -> int | None:
+    if runtime:
+        return runtime["process"].pid
+    try:
+        # Store beside settings, so isolated test settings never touch real ownership records.
+        path = SETTINGS_PATH.parent / "process-ownership.json"
+        record = json.loads(path.read_text(encoding="utf-8")).get(profile["id"], {})
+        pid = int(record.get("pid", 0))
+        if (pid > 0 and record.get("root") == str(Path(profile["path"]).resolve())
+                and record.get("identity") and process_identity(pid) == record["identity"]):
+            return pid
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def remember_process(profile: dict[str, Any], pid: int) -> None:
+    identity = process_identity(pid)
+    if not identity:
+        return
+    with CONFIG_LOCK:
+        path = SETTINGS_PATH.parent / "process-ownership.json"
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(records, dict):
+                records = {}
+        except (OSError, ValueError):
+            records = {}
+        records[profile["id"]] = {"pid": pid, "identity": identity, "root": str(Path(profile["path"]).resolve())}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+
+
+def process_belongs_to(pid: int | None, owner: int | None) -> bool:
+    if not pid or not owner:
+        return False
+    if pid == owner:
+        return True
+    parents = windows_process_snapshot(parents=True) if os.name == "nt" else {}
+    visited = set()
+    while pid and pid not in visited and len(visited) < 64:
+        visited.add(pid)
+        try:
+            pid = parents.get(pid, 0) if os.name == "nt" else int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid == owner:
+            return True
+    return False
 
 
 def process_info(pid: int | None) -> dict[str, Any] | None:
@@ -1058,15 +1328,29 @@ def minecraft_ping(port: int) -> dict[str, Any] | None:
             if packet_id != 0:
                 return None
             length = recv_varint(sock)
+            if length < 0 or length > 1024 * 1024:
+                return None
             chunks = bytearray()
             while len(chunks) < length:
                 chunk = sock.recv(length - len(chunks))
                 if not chunk:
                     break
                 chunks.extend(chunk)
-            return json.loads(chunks.decode("utf-8"))
+            value = json.loads(chunks.decode("utf-8"))
+            return value if valid_minecraft_status(value) else None
     except (OSError, ValueError, json.JSONDecodeError, ConnectionError):
         return None
+
+
+def valid_minecraft_status(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version, players = value.get("version"), value.get("players")
+    return (isinstance(version, dict) and isinstance(version.get("name"), str)
+            and type(version.get("protocol")) is int and isinstance(players, dict)
+            and type(players.get("online")) is int and players["online"] >= 0
+            and type(players.get("max")) is int and players["max"] >= 0
+            and isinstance(players.get("sample", []), list))
 
 
 def strip_motd(value: Any) -> str:
@@ -1103,9 +1387,17 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
     properties = read_properties(root)
     port = int(properties.get("server-port", "25565") or 25565)
     ping = minecraft_ping(port)
+    if not valid_minecraft_status(ping):
+        ping = None
     runtime = runtime_for(profile["id"])
-    pid = find_listening_pid(port) or (runtime["process"].pid if runtime else None)
-    running = ping is not None or pid is not None or runtime is not None
+    listener = find_listening_pid(port)
+    owner = owned_process_pid(profile, runtime)
+    listener_owned = process_belongs_to(listener, owner)
+    conflict = bool((listener or ping is not None) and not listener_owned)
+    pid = listener if listener_owned else owner
+    running = owner is not None
+    if not listener_owned:
+        ping = None
     players = (ping or {}).get("players", {})
     version = (ping or {}).get("version", {})
     detected = detect_launch(root)
@@ -1118,7 +1410,19 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
         }
     except OSError:
         storage = {"free_gb": None, "total_gb": None, "used_percent": None}
-    startup_failure = diagnose_startup_failure(root) if running and ping is None else None
+    last_exit = LAST_EXITS.get(profile["id"])
+    startup_failure = None
+    if not running and last_exit and last_exit.get("code") not in (None, 0):
+        startup_failure = diagnose_startup_failure(root)
+        if startup_failure is None:
+            startup_failure = {
+                "severity": "error",
+                "code": "process_exit",
+                "title": "服务端进程已退出",
+                "detail": f"Java 进程在启动完成前退出，退出码为 {last_exit['code']}。",
+                "suggestions": ["打开控制台查看退出前的最后日志", "检查最近新增或更新的 Mod / 插件"],
+                "source": f"runtime-{profile['id']}.log",
+            }
     return {
         "running": running,
         "ready": ping is not None,
@@ -1135,9 +1439,15 @@ def server_is_running(profile: dict[str, Any]) -> dict[str, Any]:
         },
         "external_address": profile.get("external_address", ""),
         "managed": runtime is not None,
+        "online_mode": properties.get("online-mode", "true").lower() == "true",
+        "ownership": "managed" if runtime else "recovered" if owner else "none",
+        "port_conflict": {"port": port, "pid": listener, "message": f"端口 {port} 被未确认归属的进程占用；不会自动接管或停止该进程。"} if conflict else None,
+        "operation": OPERATIONS.get(profile["id"]),
+        "active_job": active_server_job(profile["id"]),
+        "last_job": last_server_job(profile["id"]),
         "eula": eula_accepted(root),
         "storage": storage,
-        "last_exit": LAST_EXITS.get(profile["id"]),
+        "last_exit": last_exit,
         "startup_failure": startup_failure,
     }
 
@@ -1161,14 +1471,24 @@ def accept_eula(profile: dict[str, Any]) -> None:
 
 
 def collect_jvm_args(root: Path, profile: dict[str, Any]) -> list[str]:
-    args = [f"-Xms{profile.get('xms', '2G')}", f"-Xmx{profile.get('xmx', '6G')}"]
+    # Let Java parse its own argument-file syntax (quotes, comments, multiple flags).
+    # Explicit panel memory arguments come last and override file memory settings.
+    args = []
+    plan = bootstrapper.folder_plan(root)
+    if plan.get("adapter") == "gtnh" and Path(profile.get("launch_target") or plan["launch_target"]).name.casefold() == "lwjgl3ify-forgepatches.jar":
+        args.extend(f"@{safe_target(root, name)}" for name in plan["argfiles"])
+        args.extend(plan["jvm_args"])
     path = root / "user_jvm_args.txt"
     if path.exists():
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or re.match(r"^-Xm[sx]", line, re.I):
-                continue
-            args.append(line)
+        if parsed_java_major(java_version_text(profile)) == 8:
+            # Java 8 has no native @argfile support. Keep quoted Windows paths intact.
+            lexer = shlex.shlex(path.read_text(encoding="utf-8-sig"), posix=True)
+            lexer.whitespace_split = True
+            lexer.escape = ""
+            args.extend(lexer)
+        else:
+            args.append(f"@{path.resolve()}")
+    args.extend([f"-Xms{profile.get('xms', '2G')}", f"-Xmx{profile.get('xmx', '6G')}"])
     return args
 
 
@@ -1210,6 +1530,8 @@ def build_launch(profile: dict[str, Any]) -> tuple[list[str], str]:
         relative = target.relative_to(root).as_posix()
         return [java, *jvm_args, f"@{relative}", "nogui"], f"参数文件 {relative}"
     if mode == "jar":
+        if "installer" in target.name.casefold():
+            raise ValueError("这是核心安装器，不是服务端；请启用一键准备后启动")
         if target.suffix.lower() != ".jar":
             raise ValueError("JAR 启动方式必须选择 .jar 文件")
         return [java, *jvm_args, "-jar", str(target), "nogui"], f"JAR {target.name}"
@@ -1277,7 +1599,19 @@ def validate_command(line: str) -> str:
     return line
 
 
-def send_command(profile: dict[str, Any], line: str) -> None:
+def send_command(profile: dict[str, Any], line: str, maintenance: bool = False) -> None:
+    lock = action_lock(profile["id"])
+    if not lock.acquire(blocking=False):
+        raise RuntimeError("该实例正在执行维护操作，请等待完成")
+    try:
+        if active_server_job(profile["id"]) and not maintenance:
+            raise RuntimeError("该实例正在备份或恢复，暂不能发送指令")
+        _send_owned_command(profile, line)
+    finally:
+        lock.release()
+
+
+def _send_owned_command(profile: dict[str, Any], line: str) -> None:
     line = validate_command(line)
     runtime = runtime_for(profile["id"])
     if runtime and runtime["process"].stdin:
@@ -1287,10 +1621,9 @@ def send_command(profile: dict[str, Any], line: str) -> None:
             return
         except (OSError, BrokenPipeError):
             pass
-    port = int(read_properties(Path(profile["path"])).get("server-port", "25565") or 25565)
-    pid = find_listening_pid(port)
+    pid = owned_process_pid(profile, runtime)
     if not pid:
-        raise RuntimeError("服务器未运行")
+        raise RuntimeError("实例未由面板托管，无法安全发送指令；请从原控制台正常停服后再由面板启动")
     if os.name != "nt":
         raise RuntimeError("此服务器不是由面板启动，无法接管它的标准输入")
     completed = subprocess.run(
@@ -1302,9 +1635,42 @@ def send_command(profile: dict[str, Any], line: str) -> None:
         raise RuntimeError((completed.stderr or completed.stdout).strip() or "控制台指令发送失败")
 
 
-def action_lock(server_id: str) -> threading.Lock:
+def action_lock(server_id: str) -> Any:
     with RUNTIME_LOCK:
-        return ACTION_LOCKS.setdefault(server_id, threading.Lock())
+        return ACTION_LOCKS.setdefault(server_id, threading.RLock())
+
+
+def active_server_job(server_id: str) -> dict[str, Any] | None:
+    with JOBS_LOCK:
+        return next((dict(job) for job in JOBS.values() if job.get("server_id") == server_id
+                     and job.get("state") in {"queued", "running"}), None)
+
+
+def last_server_job(server_id: str) -> dict[str, Any] | None:
+    with JOBS_LOCK:
+        return next((dict(job) for job in reversed(list(JOBS.values())) if job.get("server_id") == server_id
+                     and job.get("type") in {"backup", "restore", "start", "archive_import", "ftb_import"}), None)
+
+
+@contextmanager
+def server_operation(profile: dict[str, Any], operation: str, job_id: str | None = None):
+    server_id = profile["id"]
+    lock = action_lock(server_id)
+    if not lock.acquire(blocking=False):
+        raise RuntimeError("该实例已有操作正在进行，请等待完成后重试")
+    previous = OPERATIONS.get(server_id)
+    try:
+        job = active_server_job(server_id)
+        if job and job.get("id") != job_id:
+            raise RuntimeError("该实例正在备份或恢复，请等待任务完成")
+        OPERATIONS[server_id] = operation
+        yield
+    finally:
+        if previous:
+            OPERATIONS[server_id] = previous
+        else:
+            OPERATIONS.pop(server_id, None)
+        lock.release()
 
 
 def ensure_server_write_access(root: Path) -> None:
@@ -1339,15 +1705,22 @@ def ensure_server_write_access(root: Path) -> None:
             ) from exc
 
 
-def start_server(profile: dict[str, Any]) -> str:
-    with action_lock(profile["id"]):
+def start_server(profile: dict[str, Any], job_id: str | None = None, progress=None) -> str:
+    with server_operation(profile, "starting", job_id):
         status = server_is_running(profile)
+        if status.get("port_conflict"):
+            raise RuntimeError(status["port_conflict"]["message"])
         if status["running"]:
             return "服务器已经在运行"
         root = Path(profile["path"])
         if not eula_accepted(root):
             raise RuntimeError("尚未同意 Minecraft EULA，请先在启动配置中勾选同意")
         ensure_server_write_access(root)
+        if profile.get("auto_setup", True):
+            candidates = [str(profile.get("java") or "java"), *[r["path"] for r in discover_java_runtimes()]]
+            prepared = bootstrapper.prepare(root, candidates, DATA_ROOT / "bootstrap-cache", progress or (lambda message: None))
+            if prepared:
+                profile = update_profile({"server_id": profile["id"], "profile": prepared})
         command, description = build_launch(profile)
         DATA_ROOT.mkdir(parents=True, exist_ok=True)
         runtime_log = DATA_ROOT / f"runtime-{profile['id']}.log"
@@ -1377,15 +1750,19 @@ def start_server(profile: dict[str, Any]) -> str:
             raise
         with RUNTIME_LOCK:
             RUNTIMES[profile["id"]] = {"process": process, "log": log_handle, "started_at": now_iso()}
+        try:
+            remember_process(profile, process.pid)
+        except OSError as exc:
+            log_handle.write(f"[Lodestar] 无法持久保存进程身份：{exc}\n")
         return f"已通过{description}启动；整合包首次加载可能需要几分钟"
 
 
-def stop_server(profile: dict[str, Any]) -> str:
-    with action_lock(profile["id"]):
+def stop_server(profile: dict[str, Any], job_id: str | None = None) -> str:
+    with server_operation(profile, "stopping", job_id):
         status = server_is_running(profile)
         if not status["running"]:
             return "服务器当前没有运行"
-        send_command(profile, "stop")
+        send_command(profile, "stop", maintenance=bool(job_id))
         deadline = time.time() + 90
         while time.time() < deadline:
             if not server_is_running(profile)["running"]:
@@ -1395,11 +1772,11 @@ def stop_server(profile: dict[str, Any]) -> str:
 
 
 def force_stop_server(profile: dict[str, Any]) -> str:
-    with action_lock(profile["id"]):
+    with server_operation(profile, "stopping"):
         status = server_is_running(profile)
         if not status["running"]:
             return "服务器当前没有运行"
-        pid = (status.get("process") or {}).get("pid")
+        pid = owned_process_pid(profile, runtime_for(profile["id"]))
         if not pid:
             raise RuntimeError("未找到服务器进程 PID")
         if os.name == "nt":
@@ -1413,11 +1790,11 @@ def force_stop_server(profile: dict[str, Any]) -> str:
 
 
 def restart_server(profile: dict[str, Any]) -> str:
-    status = server_is_running(profile)
-    if status["running"]:
-        stop_server(profile)
-    time.sleep(1)
-    return start_server(profile)
+    with server_operation(profile, "restarting"):
+        status = server_is_running(profile)
+        if status["running"]:
+            stop_server(profile)
+        return start_server(profile)
 
 
 def read_tail(path: Path, max_bytes: int = 300_000) -> str:
@@ -1680,18 +2057,37 @@ def read_server_text_file(profile: dict[str, Any], relative: str) -> dict[str, A
         raise ValueError("文件超过 4 MB，请下载后使用本地编辑器")
     if path.name.casefold() not in TEXT_FILE_NAMES and path.suffix.casefold() not in TEXT_FILE_SUFFIXES:
         raise ValueError("该文件类型不支持网页编辑")
-    return {"path": relative_server_path(Path(profile["path"]), path),
-            "content": path.read_text(encoding="utf-8", errors="replace"), "size": path.stat().st_size}
+    raw = path.read_bytes()
+    try:
+        content = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise ValueError("文件不是 UTF-8 编码，请下载后使用本地编辑器，避免转换损坏内容") from exc
+    return {"path": relative_server_path(Path(profile["path"]), path), "server_id": profile["id"],
+            "content": content, "size": len(raw),
+            "revision": hashlib.sha256(raw).hexdigest()}
 
 
-def save_server_text_file(profile: dict[str, Any], relative: str, content: Any) -> str:
+def save_server_text_file(profile: dict[str, Any], relative: str, content: Any, revision: str | None = None) -> str:
+    with server_operation(profile, "editing"):
+        return _save_server_text_locked(profile, relative, content, revision)
+
+
+def _save_server_text_locked(profile: dict[str, Any], relative: str, content: Any, revision: str | None) -> str:
     path = server_file_path(profile, relative)
     if not path.is_file():
         raise ValueError("当前路径不是文件")
     if path.name.casefold() not in TEXT_FILE_NAMES and path.suffix.casefold() not in TEXT_FILE_SUFFIXES:
         raise ValueError("该文件类型不支持网页编辑")
+    original = path.read_bytes()
+    if revision is not None and hashlib.sha256(original).hexdigest() != revision:
+        raise FileExistsError("文件已被其他操作修改；请重新打开并核对内容后再保存")
     text = str(content)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if b"\r\n" in original or path.suffix.lower() in {".bat", ".cmd"}:
+        text = text.replace("\n", "\r\n")
     encoded = text.encode("utf-8")
+    if original.startswith(b"\xef\xbb\xbf"):
+        encoded = b"\xef\xbb\xbf" + encoded
     if len(encoded) > MAX_TEXT_FILE_BYTES:
         raise ValueError("文本内容超过 4 MB")
     root = Path(profile["path"])
@@ -1812,9 +2208,123 @@ def list_backups(profile: dict[str, Any]) -> list[dict[str, Any]]:
             "name": path.name,
             "size_mb": round(path.stat().st_size / 1024 / 1024, 2),
             "modified": dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+            **backup_summary(path),
         }
         for path in sorted(folder.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
     ]
+
+
+def backup_summary(path: Path) -> dict[str, Any]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo(BACKUP_MANIFEST)
+            if info.file_size > 32 * 1024 * 1024:
+                raise ValueError("清单过大")
+            manifest = json.loads(archive.read(info))
+            if manifest.get("format") == 1 and manifest.get("complete") is True and isinstance(manifest.get("files"), list):
+                return {"verified": True, "worlds": manifest.get("worlds", []), "file_count": len(manifest["files"])}
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, AttributeError):
+        pass
+    return {"verified": False, "worlds": [], "file_count": None}
+
+
+def backup_worlds(root: Path) -> list[Path]:
+    root = root.resolve()
+    name = read_properties(root).get("level-name", "world") or "world"
+    primary = root / name
+    candidates = [primary, root / f"{name}_nether", root / f"{name}_the_end"]
+    candidates.extend(path for path in root.iterdir() if path.is_dir() and (path / "level.dat").is_file())
+    worlds = []
+    for path in candidates:
+        resolved = path.resolve()
+        relative = resolved.relative_to(root)
+        if not relative.parts or relative.parts[0].casefold() in {".ripple-panel", "panel-backups"}:
+            raise ValueError("世界目录必须位于服务端目录内，且不能指向面板数据")
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise ValueError(f"世界目录不支持链接：{path.name}")
+        if path.is_dir() and resolved not in worlds:
+            worlds.append(resolved)
+    if not primary.is_dir():
+        raise FileNotFoundError(f"找不到世界目录 {name}；不会创建只有配置的世界备份")
+    return worlds
+
+
+def hash_stream(stream: Any) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_backup_archive(archive: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+    infos = archive.infolist()
+    if len(infos) > MAX_ARCHIVE_FILES:
+        raise ValueError("备份文件数量超过安全上限")
+    try:
+        manifest_info = archive.getinfo(BACKUP_MANIFEST)
+        if manifest_info.file_size > 32 * 1024 * 1024:
+            raise ValueError("备份清单超过安全上限")
+        manifest = json.loads(archive.read(manifest_info))
+    except KeyError as exc:
+        raise ValueError("旧备份缺少完整性清单；文件已保留，可下载人工核验，但不能自动恢复") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != 1 or manifest.get("complete") is not True:
+        raise ValueError("备份未完成或清单格式不支持")
+    entries = manifest.get("files")
+    worlds = manifest.get("worlds")
+    if not isinstance(entries, list) or not entries or not isinstance(worlds, list) or not worlds:
+        raise ValueError("备份清单缺少世界或文件信息")
+    expected = {entry["path"]: entry for entry in entries}
+    if len(expected) != len(entries):
+        raise ValueError("备份清单包含重复文件")
+    normalized = []
+    seen = set()
+    total = 0
+    for info in infos:
+        member = normalized_archive_member(info)
+        if member.casefold() in seen or info.is_dir() or archive_member_is_symlink(info):
+            raise ValueError("备份包含重复路径、目录项或不支持的链接")
+        seen.add(member.casefold())
+        if member == BACKUP_MANIFEST:
+            continue
+        if member.split("/", 1)[0].casefold() in {".ripple-panel", "panel-backups"}:
+            raise ValueError("备份包含面板内部文件")
+        if member not in BACKUP_EXTRAS and not any(isinstance(world, str) and member.startswith(world.rstrip("/") + "/") for world in worlds):
+            raise ValueError(f"备份文件不在声明的世界范围内：{member}")
+        entry = expected.get(member)
+        if not isinstance(entry, dict) or entry.get("size") != info.file_size:
+            raise ValueError(f"备份内容与清单不一致：{member}")
+        total += info.file_size
+        if total > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("备份解压体积超过安全上限")
+        normalized.append((info, member))
+    if {member for _, member in normalized} != set(expected):
+        raise ValueError("备份缺少清单中的文件")
+    for info, member in normalized:
+        with archive.open(info) as source:
+            if hash_stream(source) != expected[member].get("sha256"):
+                raise ValueError(f"备份校验失败：{member}")
+    return normalized
+
+
+def log_positions(profile: dict[str, Any]) -> dict[Path, int]:
+    paths = [Path(profile["path"]) / "logs" / "latest.log", DATA_ROOT / f"runtime-{profile['id']}.log"]
+    return {path: path.stat().st_size if path.exists() else 0 for path in paths}
+
+
+def wait_for_save_ack(profile: dict[str, Any], positions: dict[Path, int], pattern: str, timeout: float = 45) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for path, offset in positions.items():
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    text = handle.read(1024 * 1024).decode("utf-8", errors="replace")
+                if re.search(pattern, text, re.I):
+                    return
+            except OSError:
+                continue
+        time.sleep(0.25)
+    raise TimeoutError("未收到服务端保存完成确认；请检查控制台，或正常停服后创建离线备份")
 
 
 def set_job(job_id: str, **changes: Any) -> None:
@@ -1824,58 +2334,103 @@ def set_job(job_id: str, **changes: Any) -> None:
 
 
 def create_backup_worker(profile: dict[str, Any], job_id: str) -> None:
-    root = Path(profile["path"])
-    running = server_is_running(profile)["running"]
     try:
+        with server_operation(profile, "backup", job_id):
+            _create_backup_locked(profile, job_id)
+    except Exception as exc:
+        set_job(job_id, state="error", message=str(exc))
+
+
+def _create_backup_locked(profile: dict[str, Any], job_id: str) -> None:
+    root = Path(profile["path"])
+    running = False
+    save_disabled = False
+    temporary = None
+    completed_message = None
+    try:
+        status = server_is_running(profile)
+        if status.get("port_conflict"):
+            raise RuntimeError("无法确认占用端口的服务端归属；请从原控制台停服后备份")
+        running = status["running"]
         set_job(job_id, state="running", message="正在让服务器保存世界…")
         if running:
-            send_command(profile, "save-off")
-            send_command(profile, "save-all flush")
-            time.sleep(2)
-        properties = read_properties(root)
-        world_name = properties.get("level-name", "world") or "world"
-        sources = [root / world_name]
-        extras = ["server.properties", "whitelist.json", "ops.json", "banned-players.json", "banned-ips.json"]
+            positions = log_positions(profile)
+            save_disabled = True
+            send_command(profile, "save-off", maintenance=True)
+            send_command(profile, "save-all flush", maintenance=True)
+            wait_for_save_ack(profile, positions, r"Saved the (?:game|world)|保存了游戏|已保存世界")
+        sources = backup_worlds(root)
         folder = backup_folder(profile)
         folder.mkdir(exist_ok=True)
-        destination = folder / f"backup-{dt.datetime.now():%Y%m%d-%H%M%S}.zip"
-        set_job(job_id, message=f"正在压缩 {world_name}…")
-        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
-            for source in sources:
-                if not source.exists():
-                    continue
-                for path in source.rglob("*"):
-                    if path.is_file() and not path.is_symlink():
-                        archive.write(path, path.relative_to(root))
-            for name in extras:
-                path = root / name
+        destination = folder / f"backup-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip"
+        temporary = destination.with_suffix(".partial")
+        set_job(job_id, message="正在压缩世界并生成校验清单…")
+        files = []
+        for source in sources:
+            for path in source.rglob("*"):
+                path.resolve().relative_to(root.resolve())
+                if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+                    raise ValueError(f"世界中包含不支持的链接：{path.name}")
                 if path.is_file():
-                    archive.write(path, path.relative_to(root))
+                    files.append(path)
+        if not files:
+            raise ValueError("世界目录中没有可备份文件；不会创建只有配置的世界备份")
+        files.extend(root / name for name in sorted(BACKUP_EXTRAS) if (root / name).is_file())
+        files = list(dict.fromkeys(files))
+        if len(files) + 1 > MAX_ARCHIVE_FILES:
+            raise ValueError("世界文件数量超过备份安全上限")
+        expanded_size = sum(path.stat().st_size for path in files)
+        if expanded_size > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("世界大小超过备份安全上限")
+        if shutil.disk_usage(folder).free < expanded_size + 4 * 1024 * 1024:
+            raise RuntimeError("磁盘空间不足以安全创建备份，请先释放空间或将备份复制到其他磁盘")
+        manifest = {"format": 1, "complete": True, "server_id": profile["id"], "created_at": now_iso(),
+                    "worlds": [source.relative_to(root.resolve()).as_posix() for source in sources], "files": []}
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
+            for path in files:
+                member = path.resolve().relative_to(root.resolve()).as_posix()
+                with path.open("rb") as source:
+                    checksum = hash_stream(source)
+                manifest["files"].append({"path": member, "size": path.stat().st_size, "sha256": checksum})
+                archive.write(path, member)
+            archive.writestr(BACKUP_MANIFEST, json.dumps(manifest, ensure_ascii=False))
+        with zipfile.ZipFile(temporary) as archive:
+            validate_backup_archive(archive)
+        os.replace(temporary, destination)
         keep = int(profile.get("auto_backup_keep", 10))
         backups = sorted(folder.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
         trash = folder / ".trash"
         for old in backups[keep:]:
             trash.mkdir(exist_ok=True)
             shutil.move(str(old), str(unique_destination(trash, old.name)))
-        set_job(job_id, state="done", progress=100, message=f"备份完成：{destination.name}")
+        completed_message = f"备份完成：{destination.name}"
+        if save_disabled:
+            set_job(job_id, message="归档已完成，正在确认恢复自动保存…")
+    except Exception as exc:
+        set_job(job_id, state="error", message=str(exc))
+    finally:
+        if save_disabled:
+            try:
+                positions = log_positions(profile)
+                send_command(profile, "save-on", maintenance=True)
+                wait_for_save_ack(profile, positions, r"Automatic saving is now enabled|自动保存.*(?:开启|启用)", timeout=15)
+            except Exception as exc:
+                completed_message = None
+                set_job(job_id, state="error", message=f"需要处理：未确认恢复自动保存，请在控制台执行 save-on。{exc}")
+        if temporary and temporary.exists():
+            temporary.unlink()
+    if completed_message:
+        set_job(job_id, state="done", progress=100, message=completed_message)
         with JOBS_LOCK:
             scheduled = bool(JOBS.get(job_id, {}).get("scheduled"))
         if scheduled:
             scheduler_state = read_scheduler_state()
             scheduler_state[f"backup_success:{profile['id']}"] = now_iso()
             write_scheduler_state(scheduler_state)
-    except Exception as exc:
-        set_job(job_id, state="error", message=str(exc))
-    finally:
-        if running:
-            try:
-                send_command(profile, "save-on")
-            except Exception:
-                pass
 
 
 def start_backup(profile: dict[str, Any], scheduled: bool = False) -> dict[str, Any]:
-    with JOBS_LOCK:
+    with server_operation(profile, "backup"), JOBS_LOCK:
         existing = next((job for job in JOBS.values() if job.get("server_id") == profile["id"] and job.get("state") in {"queued", "running"}), None)
         if existing:
             raise ValueError("该服务端已经有备份任务正在进行")
@@ -1894,7 +2449,8 @@ def remove_backup(profile: dict[str, Any], name: str) -> str:
     if not source.is_file():
         raise FileNotFoundError("找不到备份")
     trash = backup_folder(profile) / ".trash"
-    shutil.move(str(source), str(unique_destination(trash, source.name)))
+    with server_operation(profile, "backup_remove"):
+        shutil.move(str(source), str(unique_destination(trash, source.name)))
     return "备份已移入回收站"
 
 
@@ -1908,6 +2464,14 @@ def validate_backup_name(profile: dict[str, Any], name: str) -> Path:
 
 
 def restore_backup_worker(profile: dict[str, Any], name: str, job_id: str) -> None:
+    try:
+        with server_operation(profile, "restore", job_id):
+            _restore_backup_locked(profile, name, job_id)
+    except Exception as exc:
+        set_job(job_id, state="error", message=str(exc), error=str(exc))
+
+
+def _restore_backup_locked(profile: dict[str, Any], name: str, job_id: str) -> None:
     root = Path(profile["path"]).resolve()
     backup = validate_backup_name(profile, name)
     rollback = root / ".ripple-panel" / "restore-history" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
@@ -1915,25 +2479,15 @@ def restore_backup_worker(profile: dict[str, Any], name: str, job_id: str) -> No
     moved: list[tuple[Path, Path]] = []
     restored_top: set[str] = set()
     try:
-        if server_is_running(profile)["running"]:
+        status = server_is_running(profile)
+        if status["running"] or status.get("port_conflict"):
             raise ValueError("恢复备份前必须先停止服务器")
         set_job(job_id, state="running", progress=5, message="正在检查备份完整性…")
         with zipfile.ZipFile(backup) as archive:
-            infos = archive.infolist()
-            if not infos:
-                raise ValueError("备份压缩包为空")
-            normalized: list[tuple[zipfile.ZipInfo, str]] = []
-            total = 0
-            for info in infos:
-                member = normalized_archive_member(info)
-                if archive_member_is_symlink(info):
-                    raise ValueError(f"备份包含不支持的符号链接：{member}")
-                if member.split("/", 1)[0].casefold() in {".ripple-panel", "panel-backups"}:
-                    continue
-                total += info.file_size
-                if total > MAX_ARCHIVE_EXPANDED_BYTES:
-                    raise ValueError("备份解压体积超过安全上限")
-                normalized.append((info, member))
+            normalized = validate_backup_archive(archive)
+            total = sum(info.file_size for info, _ in normalized)
+            if shutil.disk_usage(root).free < total + 4 * 1024 * 1024:
+                raise RuntimeError("磁盘空间不足以恢复备份；当前世界未改动")
             top_names = sorted({member.split("/", 1)[0] for _, member in normalized})
             if not top_names:
                 raise ValueError("备份中没有可恢复的世界或配置")
@@ -1978,10 +2532,13 @@ def restore_backup_worker(profile: dict[str, Any], name: str, job_id: str) -> No
 
 
 def start_backup_restore(profile: dict[str, Any], name: str) -> dict[str, Any]:
-    validate_backup_name(profile, name)
-    if server_is_running(profile)["running"]:
-        raise ValueError("恢复备份前必须先停止服务器")
-    with JOBS_LOCK:
+    backup = validate_backup_name(profile, name)
+    if not backup_summary(backup)["verified"]:
+        raise ValueError("旧备份缺少完整性清单，已保留供下载核验，不能自动恢复")
+    with server_operation(profile, "restore"), JOBS_LOCK:
+        status = server_is_running(profile)
+        if status["running"] or status.get("port_conflict"):
+            raise ValueError("恢复备份前必须先停止服务器并排除端口冲突")
         existing = next((job for job in JOBS.values() if job.get("server_id") == profile["id"]
                          and job.get("state") in {"queued", "running"}), None)
         if existing:
@@ -2128,6 +2685,24 @@ def scheduler_loop() -> None:
         time.sleep(30)
 
 
+def sample_metrics() -> None:
+    for profile in read_settings()["servers"]:
+        try:
+            record_metric(profile, server_is_running(profile))
+        except (OSError, ValueError, RuntimeError):
+            # One broken instance must not interrupt sampling the others.
+            continue
+
+
+def metrics_loop() -> None:
+    while True:
+        try:
+            sample_metrics()
+        except Exception:
+            pass
+        time.sleep(10)
+
+
 def java_version_text(profile: dict[str, Any]) -> str:
     try:
         completed = subprocess.run([java_executable(profile), "-version"], capture_output=True, text=True,
@@ -2186,20 +2761,21 @@ def diagnose_startup_failure(root: Path, log_text: str | None = None) -> dict[st
         mod_matches = list(re.finditer(
             r"(?m)^\s*([^\r\n()]+?)\s*\(([-\w.]+)\)\s+has failed to load correctly", before, re.I
         ))
-        mod_name = mod_matches[-1].group(1).strip() if mod_matches else "某个 Mod"
-        mod_id = mod_matches[-1].group(2).strip() if mod_matches else "未知 ID"
-        return {
-            "severity": "error",
-            "code": "client_mod_on_server",
-            "title": "发现仅客户端可用的 Mod",
-            "detail": f"{mod_name}（{mod_id}）在专用服务端加载了客户端类 {invalid_dist.group(1)}。",
-            "suggestions": [
-                f"在 Mod 管理中停用 {mod_id}，然后重新启动",
-                "若这是整合包必需 Mod，请换用明确支持 Dedicated Server 的版本",
-                "客户端可以保留该 Mod；只需从服务端移除",
-            ],
-            "source": source,
-        }
+        if mod_matches:
+            mod_name = mod_matches[-1].group(1).strip()
+            mod_id = mod_matches[-1].group(2).strip()
+            return {
+                "severity": "error",
+                "code": "client_mod_on_server",
+                "title": "发现仅客户端可用的 Mod",
+                "detail": f"{mod_name}（{mod_id}）在专用服务端加载了客户端类 {invalid_dist.group(1)}。",
+                "suggestions": [
+                    f"在 Mod 管理中停用 {mod_id}，然后重新启动",
+                    "若这是整合包必需 Mod，请换用明确支持 Dedicated Server 的版本",
+                    "客户端可以保留该 Mod；只需从服务端移除",
+                ],
+                "source": source,
+            }
 
     if re.search(r"(?:Address already in use|Failed to bind to port|端口.*(?:占用|绑定失败))", clean, re.I):
         return {
@@ -2245,6 +2821,8 @@ def preflight_data(profile: dict[str, Any]) -> dict[str, Any]:
     detected = detect_launch(root)
     properties = read_properties(root)
     status = server_is_running(profile)
+    plan = detected.get("bootstrap") or {}
+    automatic = profile.get("auto_setup", True) and plan.get("supported")
     checks: list[dict[str, str]] = []
 
     def add(level: str, title: str, detail: str) -> None:
@@ -2254,15 +2832,22 @@ def preflight_data(profile: dict[str, Any]) -> dict[str, Any]:
         add("ok", "服务端目录", str(root))
     else:
         add("error", "服务端目录不存在", str(root))
-    try:
-        _, description = build_launch(profile)
-        add("ok", "启动目标", description)
-    except Exception as exc:
-        add("error", "启动目标不可用", str(exc))
+    if automatic:
+        add("warning" if plan.get("needs_install") else "ok", "自动准备启动目标",
+            f"{plan['loader']} {plan.get('loader_version', '')} · "
+            + ("一键开服时安装或继续上次安装" if plan.get("needs_install") else "复用现有核心"))
+    else:
+        try:
+            _, description = build_launch(profile)
+            add("ok", "启动目标", description)
+        except Exception as exc:
+            add("error", "启动目标不可用", str(exc))
     java_text = java_version_text(profile)
     java_major = parsed_java_major(java_text)
-    needed = required_java_major(detected.get("version", ""))
-    if java_major is None:
+    needed = plan.get("java_major") or required_java_major(detected.get("version", ""))
+    if automatic and java_major != needed:
+        add("warning", "自动匹配 Java", f"开服时验证并选择 Java {needed}；本机没有时下载便携版，不改系统 PATH")
+    elif java_major is None:
         add("error", "Java 无法运行", java_text)
     elif needed and java_major < needed:
         add("error", "Java 版本过低", f"Minecraft {detected.get('version')} 建议 Java {needed}+；当前 {java_major}")
@@ -2275,7 +2860,9 @@ def preflight_data(profile: dict[str, Any]) -> dict[str, Any]:
     port = int(properties.get("server-port", "25565") or 25565)
     owner = find_listening_pid(port)
     current_pid = (status.get("process") or {}).get("pid")
-    if owner and owner != current_pid:
+    if status.get("port_conflict"):
+        add("error", "端口归属未确认", status["port_conflict"]["message"])
+    elif owner and owner != current_pid:
         add("error", "端口被占用", f"端口 {port} 正被 PID {owner} 使用")
     else:
         add("ok", "监听端口", f"{port} 可用" if not owner else f"{port} 由当前服务端监听")
@@ -2413,7 +3000,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         self._security_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(path.stat().st_size))
-        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.send_header("Content-Disposition", f"attachment; filename=download; filename*=UTF-8''{quote(download_name, safe='')}")
         self.end_headers()
         with path.open("rb") as handle:
             while True:
@@ -2516,7 +3103,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/jobs":
                 with JOBS_LOCK:
-                    jobs = list(JOBS.values())[-20:]
+                    wanted = query.get("id", [None])[0]
+                    jobs = [JOBS[wanted]] if wanted in JOBS else [] if wanted else list(JOBS.values())[-20:]
                 self._json({"ok": True, "data": jobs})
                 return
             if path == "/api/automation":
@@ -2572,14 +3160,14 @@ class PanelHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/api/mods/upload":
-                profile = get_profile(self.headers.get("X-Server-Id"))
+                profile = require_profile(self.headers.get("X-Server-Id"))
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 kind = self.headers.get("X-Content-Kind", "mods")
                 message = save_uploaded_mod(profile, self.headers.get("X-Filename", ""), self.rfile, length, kind)
                 self._json({"ok": True, "message": message})
                 return
             if path == "/api/file/upload":
-                profile = get_profile(self.headers.get("X-Server-Id"))
+                profile = require_profile(self.headers.get("X-Server-Id"))
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 message = save_uploaded_file(profile, self.headers.get("X-Relative-Path", ""), self.rfile, length)
                 self._json({"ok": True, "message": message})
@@ -2591,9 +3179,19 @@ class PanelHandler(BaseHTTPRequestHandler):
                 result = {"data": inspect_server_archive(str(payload.get("path", "")))}
             elif path == "/api/import/archive/execute":
                 result = {"message": "服务端导入任务已开始", "job": start_archive_import(payload)}
+            elif path == "/api/import/ftb":
+                result = {"message": "FTB 一键开服任务已开始", "job": start_ftb_import(payload)}
+            elif path == "/api/start/cancel":
+                result = {"message": cancel_start_job(str(payload.get("job_id", "")))}
             elif path == "/api/servers/import":
+                if payload.get("start_after_import") and (payload.get("trust_pack") is not True or payload.get("accept_eula") is not True):
+                    raise ValueError("请明确同意 Minecraft EULA 并确认信任整合包和官方依赖下载")
                 profile = register_server(payload)
                 result = {"message": "服务端已导入", "profile": public_profile(profile)}
+                if payload.get("start_after_import"):
+                    if payload.get("accept_eula") is True:
+                        accept_eula(profile)
+                    result.update(message="已导入，正在一键开服", job=start_one_click(profile))
             elif path == "/api/servers/select":
                 select_server(str(payload.get("server_id", "")))
                 result = {"message": "已切换服务端"}
@@ -2606,11 +3204,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             elif path == "/api/servers/pick-folder":
                 result = {"path": pick_server_folder()}
             else:
-                profile = get_profile(str(payload.get("server_id") or "") or None)
+                profile = require_profile(payload.get("server_id"))
                 if path == "/api/action":
                     action = str(payload.get("action", ""))
                     if action == "start":
-                        message = start_server(profile)
+                        result = {"message": "一键开服任务已开始", "job": start_one_click(profile)}
                     elif action == "stop":
                         message = stop_server(profile)
                     elif action == "restart":
@@ -2625,14 +3223,16 @@ class PanelHandler(BaseHTTPRequestHandler):
                         message = "指令已发送"
                     else:
                         raise ValueError("未知服务器操作")
-                    result = {"message": message}
+                    if action != "start":
+                        result = {"message": message}
                 elif path == "/api/command":
                     command = validate_command(str(payload.get("command", "")))
                     send_command(profile, command)
                     result = {"message": f"已发送：{command}"}
                 elif path == "/api/config":
                     changes = validate_properties(payload.get("settings"))
-                    write_properties(Path(profile["path"]), changes)
+                    with server_operation(profile, "editing"):
+                        write_properties(Path(profile["path"]), changes)
                     result = {"message": "配置已保存；服务器运行中时需要重启才会生效"}
                 elif path == "/api/mods/action":
                     message = change_mod_state(profile, str(payload.get("action", "")),
@@ -2640,8 +3240,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                                                str(payload.get("kind", "mods")))
                     result = {"message": message}
                 elif path == "/api/file/save":
-                    message = save_server_text_file(profile, str(payload.get("path", "")), payload.get("content", ""))
-                    result = {"message": message}
+                    revision = payload.get("revision")
+                    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
+                        raise ValueError("缺少文件版本信息，请刷新面板并重新打开文件")
+                    relative = str(payload.get("path", ""))
+                    with server_operation(profile, "editing"):
+                        message = save_server_text_file(profile, relative, payload.get("content", ""), revision)
+                        saved = read_server_text_file(profile, relative)
+                    result = {"message": message, "revision": saved["revision"]}
                 elif path == "/api/file/action":
                     message = file_manager_action(profile, str(payload.get("action", "")),
                                                   str(payload.get("path", "")), str(payload.get("name", "")))
@@ -2696,6 +3302,7 @@ def main() -> None:
             return
         raise
     threading.Thread(target=scheduler_loop, daemon=True, name="lodestar-scheduler").start()
+    threading.Thread(target=metrics_loop, daemon=True, name="lodestar-metrics").start()
     if not args.no_browser:
         threading.Timer(0.7, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
     print(f"{APP_NAME} 已启动：http://{HOST}:{PORT}")

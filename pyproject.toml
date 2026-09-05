@@ -1,6 +1,6 @@
 [project]
 name = "lodestar-minecraft-server-studio"
-version = "3.0.0"
+version = "3.1.0"
 description = "Import a Minecraft server ZIP and launch it from a local web studio"
 readme = "README.md"
 requires-python = ">=3.11"

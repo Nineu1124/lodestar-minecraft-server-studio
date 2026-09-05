@@ -1054,12 +1054,12 @@ html[data-theme="dark"] .hero-art::after {
 .source-tabs {
   margin: 24px 0 28px;
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border-bottom: 1px solid var(--line-strong);
 }
 
 .source-tabs button {
-  padding: 14px 18px;
+  padding: 14px 10px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;

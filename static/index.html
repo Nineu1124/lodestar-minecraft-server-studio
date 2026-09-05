@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/app.css">
   <link rel="stylesheet" href="/editorial.css">
   <link rel="stylesheet" href="/report-theme.css">
+  <link rel="stylesheet" href="/studio-art.css?v=20260905-1">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -22,11 +23,12 @@
       </div>
 
       <div class="server-library">
-        <div class="section-label"><span>当前实例</span><button class="server-add-button" id="import-open" title="导入服务端" aria-label="导入服务端">添加</button></div>
+        <div class="section-label"><span>我的实例</span><button class="server-add-button" id="import-open" title="导入服务端" aria-label="导入服务端">＋ 添加</button></div>
         <div id="server-list" class="server-list"></div>
       </div>
 
       <nav class="nav-list" aria-label="主导航">
+        <span class="nav-section-label">工作空间</span>
         <button class="nav-item active" data-view="dashboard"><span>⌂</span>概览</button>
         <button class="nav-item" data-view="performance"><span>⌁</span>性能趋势</button>
         <button class="nav-item" data-view="console"><span>›_</span>控制台</button>
@@ -35,6 +37,7 @@
         <button class="nav-item" data-view="settings"><span>⚙</span>配置与启动</button>
         <button class="nav-item" data-view="players"><span>♙</span>玩家管理</button>
         <button class="nav-item" data-view="rules"><span>◌</span>游戏规则</button>
+        <span class="nav-section-label">维护与安全</span>
         <button class="nav-item" data-view="backups"><span>◴</span>世界备份</button>
         <button class="nav-item" data-view="automation"><span>◎</span>自动化</button>
         <button class="nav-item" data-view="diagnostics"><span>⌁</span>运行诊断</button>
@@ -43,7 +46,7 @@
 
       <div class="sidebar-note">
         <i class="status-dot safe"></i>
-        <div><strong>仅限本机访问</strong></div>
+        <div><strong>本地连接，安心管理</strong><small>127.0.0.1 · 仅限本机</small></div>
       </div>
     </aside>
 
@@ -53,8 +56,9 @@
       <header class="topbar">
         <button class="mobile-menu icon-button" id="mobile-menu" type="button" aria-label="打开导航菜单" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="server-heading">
-          <div class="eyebrow" id="server-path">尚未导入服务端</div>
+          <div class="workspace-crumb">工作台 <span>/</span> <span id="view-label">概览</span></div>
           <h1 id="server-title">Lodestar</h1>
+          <div class="eyebrow" id="server-path">尚未导入服务端</div>
         </div>
         <div class="top-actions">
           <div class="status-pill offline" id="status-pill"><i></i><span>未连接</span></div>
@@ -62,14 +66,17 @@
             <span class="sun">☀</span><span class="moon">☾</span>
           </button>
           <button class="button ghost" id="stop-button">正常停服</button>
-          <button class="button primary" id="start-button">启动服务端</button>
+          <button class="button primary" id="start-button">一键开服</button>
         </div>
       </header>
+
+      <div class="connection-banner hidden" id="connection-banner" role="status"><span>面板连接中断，当前数据可能已过期。</span><button type="button" id="connection-retry">重新连接 ↗</button></div>
+      <div class="attention-strip hidden" id="startup-task" role="status"><div><strong id="startup-task-title">正在一键开服</strong><p id="startup-task-detail"></p></div><button type="button" class="text-button" id="cancel-start">取消开服</button></div>
 
       <div id="toast-region" class="toast-region" aria-live="polite"></div>
 
       <div class="empty-state hidden" id="empty-state">
-        <div class="empty-illustration">⌁</div>
+        <div class="empty-illustration" aria-hidden="true"><img src="/assets/studio/seed-v1.png" alt="" width="1254" height="1254" decoding="async" loading="lazy"></div>
         <h2>先导入一个 Minecraft 服务端</h2>
         <p>可以是 Forge、NeoForge、Fabric、Paper、Purpur、原版服务端或带启动脚本的整合包服务端。</p>
         <button class="button primary" id="empty-import">导入服务端</button>
@@ -77,18 +84,28 @@
 
       <div id="workspace">
         <section class="view active" data-view-panel="dashboard">
-          <div class="hero-card">
+          <div class="overview-heading"><div><span class="overline">YOUR WORLD, AT A GLANCE</span><h2>一切，尽在掌握。</h2></div><span id="sync-time" class="sync-time">正在同步状态…</span></div>
+          <div class="attention-strip hidden" id="status-notice" role="status"><div><strong id="notice-title">需要处理</strong><p id="notice-detail"></p></div><button class="text-button" data-view-jump="diagnostics">查看诊断 ↗</button></div>
+          <div class="overview-top">
+          <div class="hero-card" id="hero-card" data-state="offline">
             <div class="hero-copy">
-              <span class="overline">服务器状态</span>
+              <span class="hero-state"><i></i><span id="hero-state-label">等待连接</span></span>
               <h2 id="hero-title">正在读取服务端…</h2>
               <p id="hero-subtitle">面板会自动检测端口、加载器和在线玩家。</p>
               <div class="hero-actions">
                 <button class="button primary" data-action="start">启动</button>
-                <button class="button soft" data-action="restart">重启</button>
-                <button class="button ghost" data-view-jump="console">打开控制台</button>
+                <button class="button ghost" data-view-jump="console">打开控制台 ↗</button>
               </div>
             </div>
-            <figure class="hero-art" aria-hidden="true"><img src="/assets/server-world-hero.png" alt=""></figure>
+            <figure class="hero-art" aria-hidden="true"><img src="/assets/studio/world-v1.png" alt="" width="1536" height="1024" decoding="async" fetchpriority="high"></figure>
+            <span class="hero-caption" aria-hidden="true">LODESTAR · A WORLD WORTH KEEPING</span>
+          </div>
+          <article class="backup-overview">
+            <div class="card-heading"><span class="overline">世界保障</span><span class="backup-state pending" id="overview-backup-state">待检查</span></div>
+            <div class="backup-intro"><h3 id="overview-backup-title">为世界留一个还原点。</h3><figure class="backup-vignette" aria-hidden="true"><img src="/assets/studio/vault-v1.png" alt="" width="1254" height="1254" decoding="async"></figure></div>
+            <div class="backup-record"><span>最近已完成备份</span><strong id="overview-backup-time">正在读取…</strong><small id="overview-backup-meta">完整性校验 · 恢复前保留原文件</small></div>
+            <div class="backup-overview-actions"><button class="button soft" id="overview-backup" type="button">创建备份</button><button class="text-button" data-view-jump="backups">全部备份 ↗</button></div>
+          </article>
           </div>
 
           <div class="metric-grid">
@@ -102,16 +119,18 @@
 
           <div class="dashboard-grid">
             <article class="panel-card quick-card">
-              <div class="card-heading"><div><h3>世界操作</h3></div></div>
+              <div class="card-heading"><div><span class="overline">QUICK ACTIONS</span><h3>世界操作</h3></div><span class="subtle-label">即刻生效</span></div>
               <div class="quick-grid">
                 <button class="quick-action" data-action="save"><i>↧</i><span><strong>保存世界</strong></span></button>
                 <button class="quick-action" data-action="day"><i>☀</i><span><strong>切换白天</strong></span></button>
                 <button class="quick-action" data-action="clear_weather"><i>☁</i><span><strong>清除天气</strong></span></button>
                 <button class="quick-action" data-action="keep_inventory_on"><i>♜</i><span><strong>死亡不掉落</strong></span></button>
               </div>
+              <div class="log-preview-heading"><span><i class="live-dot"></i>最近日志</span><button class="text-button" data-view-jump="console">完整控制台 ↗</button></div>
+              <pre id="overview-log" class="log-preview">正在读取实例动态…</pre>
             </article>
             <article class="panel-card details-card">
-              <div class="card-heading"><div><h3>服务器信息</h3></div><button class="text-button" data-view-jump="settings">编辑</button></div>
+              <div class="card-heading"><div><span class="overline">INSTANCE DETAILS</span><h3>连接与配置</h3></div><figure class="connection-art" aria-hidden="true"><img src="/assets/studio/observatory-v1.png" alt="" width="1254" height="1254" decoding="async" loading="lazy"></figure><button class="text-button" data-view-jump="settings">编辑 ↗</button></div>
               <dl class="detail-list">
                 <div><dt>启动方式</dt><dd id="detail-launch">—</dd></div>
                 <div><dt>内存范围</dt><dd id="detail-memory">—</dd></div>
@@ -119,6 +138,8 @@
                 <div><dt>SakuraFRP</dt><dd id="detail-frp">未检测</dd></div>
                 <div><dt>正版验证</dt><dd id="detail-online-mode">—</dd></div>
               </dl>
+              <button class="copy-address" id="copy-address" type="button">复制玩家连接地址 <span aria-hidden="true">↗</span></button>
+              <p class="local-hint">FRP 进程状态不代表外网已连通。管理面板始终只供本机访问。</p>
             </article>
           </div>
         </section>
@@ -223,6 +244,7 @@
 
             <form class="panel-card form-card" id="launch-form">
               <div class="card-heading"><div><span class="overline">运行环境</span><h3>Java 与启动方式</h3></div><button type="submit" class="button primary small">保存启动配置</button></div>
+              <label class="agreement-row"><input type="checkbox" name="auto_setup" checked><span>一键准备：自动匹配 Java、安装缺失核心并保留必要参数。关闭后严格使用下方手动配置。</span></label>
               <div class="form-grid two">
                 <label class="wide"><span>显示名称</span><input name="name" maxlength="80"></label>
                 <label class="wide"><span>Java 可执行文件</span><input name="java" placeholder="java 或 java.exe 的完整路径"></label>
@@ -313,7 +335,7 @@
 
         <section class="view" data-view-panel="backups">
           <div class="view-heading">
-            <div><span class="overline">世界安全</span><h2>世界备份</h2><p>在线备份前会临时关闭自动保存、强制落盘，完成后恢复自动保存。</p></div>
+            <div><span class="overline">世界安全</span><h2>世界备份</h2><p>等待保存确认后备份全部已识别世界；恢复前校验内容，并保留当前文件。</p></div>
             <button class="button primary" id="backup-create">创建备份</button>
           </div>
           <div class="job-card hidden" id="backup-job"><div class="job-spinner"></div><div><strong id="job-title">正在备份</strong><span id="job-message">准备中…</span></div><div class="job-progress"><i id="job-progress"></i></div></div>
@@ -322,6 +344,7 @@
             <div class="table-empty hidden" id="backup-empty">还没有面板备份</div>
           </div>
           <div class="hint-strip"><strong>存储位置</strong><span>备份保存在服务端的 panel-backups 文件夹中；超过保留数量的旧备份会移入其中的 .trash。</span></div>
+          <div class="hint-strip warning"><strong>旧备份已保留</strong><span>没有完整性清单的旧 ZIP 仍可下载，但不开放自动恢复。回收站中的文件仍占用磁盘空间。</span></div>
         </section>
 
         <section class="view" data-view-panel="automation">
@@ -390,7 +413,7 @@
         </section>
 
         <section class="view" data-view-panel="about">
-          <div class="view-heading editorial-heading"><div><span class="overline">本地服务端工作台</span><h2>从压缩包，到一个正在运行的世界。</h2><p>Lodestar 专注于在本机导入、配置和运行 Minecraft 服务端。</p></div><span class="version-tag">v3.0.0</span></div>
+          <div class="view-heading editorial-heading"><div><span class="overline">本地服务端工作台</span><h2>从压缩包，到一个正在运行的世界。</h2><p>Lodestar 专注于在本机导入、配置和运行 Minecraft 服务端。</p></div><span class="version-tag">v3.1.0</span></div>
           <div class="feature-grid">
             <article class="feature-card"><i>⌘</i><h3>多实例</h3><p>导入并切换不同服务端，自动识别常见加载器和启动文件。</p></article>
             <article class="feature-card"><i>›_</i><h3>网页控制台</h3><p>查看实时日志，发送任意 Minecraft 服务端指令。</p></article>
@@ -398,7 +421,7 @@
             <article class="feature-card"><i>◴</i><h3>安全备份</h3><p>在线保存后压缩世界与关键玩家配置，并按数量轮换。</p></article>
             <article class="feature-card"><i>♙</i><h3>玩家权限</h3><p>白名单、OP、踢出与封禁操作集中处理。</p></article>
             <article class="feature-card"><i>◌</i><h3>游戏规则</h3><p>实时调整时间、天气、难度与常用 gamerule。</p></article>
-            <article class="feature-card"><i>◐</i><h3>暖色双主题</h3><p>浅色陶土与深色炭火主题，可跟随系统或手动切换。</p></article>
+            <article class="feature-card"><i>◐</i><h3>暖纸与深林</h3><p>暖纸色日间与深林色夜间主题，可跟随系统或手动切换。</p></article>
             <article class="feature-card"><i>◎</i><h3>自动化维护</h3><p>按间隔备份世界，在每天固定时间正常重启。</p></article>
             <article class="feature-card"><i>⌁</i><h3>运行诊断</h3><p>聚合 Java、崩溃报告和日志中的高信号错误。</p></article>
           </div>
@@ -427,6 +450,7 @@
       <div class="source-tabs" role="tablist">
         <button type="button" class="active" data-import-source="archive">服务端压缩包</button>
         <button type="button" data-import-source="folder">已解压文件夹</button>
+        <button type="button" data-import-source="ftb">FTB 官方整合包</button>
       </div>
 
       <section data-import-panel="archive">
@@ -434,6 +458,7 @@
         <label><span>压缩包路径</span><div class="input-action"><input id="archive-path" placeholder="D:\MC_server\服务端压缩包\MyServer.zip"><button type="button" class="button soft" id="pick-archive">选择压缩包</button></div></label>
         <div class="archive-review hidden" id="archive-review">
           <div class="archive-summary" id="archive-summary"></div>
+          <p class="local-hint" id="archive-plan"></p>
           <div class="wizard-step"><span>02</span><div><strong>确认开服参数</strong><small>这些参数只作用于新导入的实例，之后仍可在配置页修改。</small></div></div>
           <div class="setup-mode" role="radiogroup" aria-label="开服方式">
             <label><input type="radio" name="setup_mode" value="quick" checked><span><strong>一键推荐</strong><small>自动选择 Java、启动器和常用配置</small></span></label>
@@ -443,7 +468,7 @@
             <label><span>实例名称</span><input name="archive_name" maxlength="80"></label>
             <label><span>解压到</span><input name="destination"></label>
             <label class="wide"><span>Java</span><select name="archive_java" id="archive-java"></select></label>
-            <label><span>最小内存</span><input name="archive_xms" value="2G"></label>
+            <label><span>最小内存</span><input name="archive_xms" value="1G"></label>
             <label><span>最大内存</span><input name="archive_xmx" value="8G"></label>
             <label class="wide"><span>启动文件</span><select name="archive_launch" id="archive-launch"></select></label>
             <label><span>监听端口</span><input type="number" name="server_port" min="1" max="65535" value="25565"></label>
@@ -459,10 +484,10 @@
             <label class="switch-row"><span><strong>允许飞行</strong></span><input name="allow_flight" type="checkbox"><i></i></label>
             <label class="switch-row"><span><strong>启用白名单</strong></span><input name="whitelist" type="checkbox"><i></i></label>
           </div>
-          <label class="agreement-row"><input type="checkbox" name="accept_eula" required><span>我已阅读并同意 Minecraft EULA</span></label>
+          <label class="agreement-row"><input type="checkbox" name="accept_eula"><span>我已阅读并同意 <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener">Minecraft EULA</a></span></label>
+          <label class="agreement-row"><input type="checkbox" name="trust_pack"><span>我信任此整合包，允许运行其中的代码，并下载官方核心及便携 Java（可能数 GB，不改系统 PATH）。</span></label>
           <label class="agreement-row"><input type="checkbox" name="start_after_import" checked><span>导入完成后立即启动服务器</span></label>
         </div>
-        <div class="import-progress hidden" id="import-progress"><div><span id="import-progress-label">准备导入…</span><strong id="import-progress-value">0%</strong></div><i><b id="import-progress-bar"></b></i></div>
       </section>
 
       <section class="hidden" data-import-panel="folder">
@@ -474,11 +499,28 @@
           <label><span>最小内存</span><input name="xms" value="2G"></label>
           <label><span>最大内存</span><input name="xmx" value="8G"></label>
         </div>
+        <label class="agreement-row"><input type="checkbox" name="folder_eula" required><span>我已阅读并同意 Minecraft EULA</span></label>
+        <label class="agreement-row"><input type="checkbox" name="folder_trust" required><span>信任此目录中的代码，允许自动准备官方核心与便携 Java</span></label>
+        <label class="agreement-row"><input type="checkbox" name="folder_start" checked><span>导入后立即一键开服（已有世界保持不变）</span></label>
       </section>
+      <section class="hidden" data-import-panel="ftb">
+        <p>从 FTB 官方清单下载服务端文件，自动校验、安装核心并开服。失败后可在已创建的实例中点“一键开服”继续，不必重新下载。</p>
+        <div class="form-grid two">
+          <label><span>FTB 项目 ID</span><input type="number" name="ftb_pack" value="125" min="1" required></label>
+          <label><span>版本 ID（留空取稳定版）</span><input type="number" name="ftb_version" placeholder="例如 100487" min="1"></label>
+          <label class="wide"><span>新建服务端目录</span><input name="ftb_destination" placeholder="D:\MC-Servers\FTB-Evolution" required></label>
+          <label><span>最大内存</span><input name="ftb_xmx" value="6G"></label>
+          <label><span>游戏端口</span><input type="number" name="ftb_port" value="25565" min="1" max="65535"></label>
+        </div>
+        <label class="agreement-row"><input type="checkbox" name="ftb_eula" required><span>我已阅读并同意 <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener">Minecraft EULA</a></span></label>
+        <label class="agreement-row"><input type="checkbox" name="ftb_trust" required><span>信任此整合包，允许下载并运行官方服务端文件和便携 Java（可能数 GB）</span></label>
+      </section>
+      <div class="import-progress hidden" id="import-progress"><div><span id="import-progress-label">准备导入…</span><strong id="import-progress-value">0%</strong></div><i><b id="import-progress-bar"></b></i><button type="button" class="text-button" id="cancel-import">取消任务（保留文件）</button></div>
       <div class="modal-actions"><button type="button" class="button ghost" data-modal-close>取消</button><button type="submit" class="button primary" id="import-submit">检查压缩包</button></div>
     </form>
   </div>
 
+  <script src="/studio-art.js?v=20260905-1" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

@@ -10,6 +10,12 @@ const state = {
   filePath: "",
   files: [],
   editingFile: null,
+  editorRequest: 0,
+  statusRequest: 0,
+  switching: false,
+  connected: false,
+  pendingAction: null,
+  lastUpdated: null,
   view: "dashboard",
   commandHistory: [],
   commandIndex: 0,
@@ -110,6 +116,10 @@ function loadCommandHistory() {
 }
 
 async function api(path, options = {}) {
+  const requestedId = options.body?.server_id || new URL(path, window.location.href).searchParams.get("server_id");
+  if (state.switching && options.method === "POST" && path !== "/api/servers/select") {
+    throw new Error("正在切换实例，请稍候再操作");
+  }
   const init = { method: options.method || "GET", headers: { ...(options.headers || {}) } };
   if (options.body !== undefined) {
     init.headers["Content-Type"] = "application/json";
@@ -123,6 +133,9 @@ async function api(path, options = {}) {
     throw new Error(`面板返回了无法解析的内容（HTTP ${response.status}）`);
   }
   if (!response.ok || payload.ok === false) throw new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+  if (requestedId && requestedId !== state.activeId && path !== "/api/servers/select") {
+    throw new Error("实例已切换，已忽略旧实例的响应");
+  }
   return payload;
 }
 
@@ -142,9 +155,12 @@ function setBusy(button, busy, label) {
     button.dataset.originalText = button.textContent;
     button.textContent = label || "处理中…";
     button.disabled = true;
+    button.dataset.busy = "true";
   } else {
     button.textContent = button.dataset.originalText || button.textContent;
     button.disabled = false;
+    delete button.dataset.busy;
+    syncActionButtons();
   }
 }
 
@@ -166,7 +182,7 @@ function initializeTheme() {
 function openImportModal() {
   $("#import-modal").classList.remove("hidden");
   switchImportSource(state.importSource || "archive");
-  window.setTimeout(() => $(state.importSource === "folder" ? "#import-path" : "#archive-path").focus(), 50);
+  window.setTimeout(() => $(state.importSource === "folder" ? "#import-path" : state.importSource === "ftb" ? '[name="ftb_pack"]' : "#archive-path").focus(), 50);
 }
 
 function closeImportModal() {
@@ -180,10 +196,27 @@ function setMobileMenu(open) {
   document.body.classList.toggle("menu-open", open);
   button.setAttribute("aria-expanded", String(open));
   button.setAttribute("aria-label", open ? "关闭导航菜单" : "打开导航菜单");
+  syncNavigationAccessibility();
+}
+
+function syncNavigationAccessibility() {
+  const sidebar = $("#sidebar");
+  const mobile = window.matchMedia("(max-width: 780px)").matches;
+  if (!mobile) {
+    sidebar.classList.remove("open");
+    document.body.classList.remove("menu-open");
+    $("#mobile-menu").setAttribute("aria-expanded", "false");
+    $("#mobile-menu").setAttribute("aria-label", "打开导航菜单");
+  }
+  const hidden = mobile && !sidebar.classList.contains("open");
+  sidebar.inert = hidden;
+  sidebar.setAttribute("aria-hidden", String(hidden));
 }
 
 function showView(view) {
   state.view = view;
+  const label = $(`.nav-item[data-view="${view}"]`);
+  if ($("#view-label")) $("#view-label").textContent = label?.textContent.trim() || "工作台";
   $$(".nav-item").forEach((button) => {
     const active = button.dataset.view === view;
     button.classList.toggle("active", active);
@@ -193,6 +226,7 @@ function showView(view) {
   $$(".view").forEach((panel) => panel.classList.toggle("active", panel.dataset.viewPanel === view));
   setMobileMenu(false);
   if (!state.activeId) return;
+  if (view === "dashboard") refreshOverview();
   if (view === "console") refreshLogs();
   if (view === "performance") refreshPerformance();
   if (view === "mods") refreshMods();
@@ -226,11 +260,21 @@ function renderWorkspaceState() {
   if (empty) {
     $("#server-title").textContent = "Lodestar";
     $("#server-path").textContent = "尚未导入服务端";
+  } else {
+    const server = activeServer();
+    $("#server-title").textContent = server.name;
+    $("#server-path").textContent = server.path;
+    $("#server-path").title = server.path;
   }
+  $("#copy-address").disabled = !activeServer()?.external_address;
+  syncActionButtons();
 }
 
 async function bootstrap(preferredId = null) {
   const payload = await api("/api/bootstrap");
+  state.connected = true;
+  document.body.classList.remove("disconnected");
+  $("#connection-banner").classList.add("hidden");
   state.servers = payload.data.servers || [];
   state.activeId = preferredId && state.servers.some((item) => item.id === preferredId)
     ? preferredId
@@ -241,10 +285,14 @@ async function bootstrap(preferredId = null) {
     loadCommandHistory();
     await refreshStatus();
     await refreshCurrentView();
+  } else {
+    setStatusPill(null);
+    $("#status-pill span").textContent = "待导入";
   }
 }
 
 async function refreshCurrentView() {
+  if (state.view === "dashboard") return refreshOverview();
   if (state.view === "console") return refreshLogs();
   if (state.view === "performance") return refreshPerformance();
   if (state.view === "mods") return refreshMods();
@@ -257,30 +305,84 @@ async function refreshCurrentView() {
 }
 
 async function selectServer(serverId) {
-  if (serverId === state.activeId) return;
-  await api("/api/servers/select", { method: "POST", body: { server_id: serverId } });
-  state.activeId = serverId;
-  state.status = null;
-  state.mods = [];
-  state.logCleared = false;
-  loadCommandHistory();
-  renderServerList();
-  await refreshStatus();
-  await refreshCurrentView();
+  if (serverId === state.activeId || state.switching || state.pendingAction) return;
+  if (!confirmDiscardEditor()) return;
+  state.switching = true;
+  syncActionButtons();
+  try {
+    await api("/api/servers/select", { method: "POST", body: { server_id: serverId } });
+    resetFileEditor();
+    state.activeId = serverId;
+    state.status = null;
+    state.connected = false;
+    state.statusRequest++;
+    state.mods = [];
+    state.files = [];
+    state.filePath = "";
+    state.logCleared = false;
+    $("#console-output").textContent = "正在读取当前实例日志…";
+    $("#properties-form").reset();
+    $("#launch-form").reset();
+    loadCommandHistory();
+    renderWorkspaceState();
+    renderServerList();
+    await refreshStatus();
+    await refreshCurrentView();
+  } finally {
+    state.switching = false;
+    syncActionButtons();
+  }
+}
+
+function editorIsDirty() {
+  return Boolean(state.editingFile && $("#file-editor-content").value !== state.editingFile.original);
+}
+
+function confirmDiscardEditor() {
+  return !editorIsDirty() || window.confirm("当前文件有未保存的修改。确定放弃这些修改吗？");
+}
+
+function resetFileEditor() {
+  state.editorRequest++;
+  state.editingFile = null;
+  $("#file-editor-content").value = "";
+  $("#file-editor").classList.add("hidden");
+}
+
+function syncActionButtons() {
+  const status = state.status;
+  const busy = Boolean(state.switching || state.pendingAction || status?.operation || status?.active_job);
+  const unavailable = !state.activeId || !state.connected;
+  $$('[data-action], #start-button, #stop-button, #force-stop, #backup-create, #overview-backup').forEach((button) => {
+    const action = button.dataset.action || ({"stop-button": "stop", "force-stop": "force_stop", "start-button": "start"})[button.id];
+    const needsRunning = action && !["start", "restart"].includes(action);
+    const portBlocked = status?.port_conflict && !["stop", "force_stop"].includes(action);
+    button.disabled = Boolean(button.dataset.busy || unavailable || busy || portBlocked || (needsRunning && !status?.running));
+  });
+  $$(".server-entry").forEach((button) => { button.disabled = state.switching || Boolean(state.pendingAction); });
 }
 
 function setStatusPill(status) {
   const pill = $("#status-pill");
   pill.classList.remove("online", "offline", "starting", "error");
-  if (status?.ready) {
+  if (!state.connected) {
+    pill.classList.add("error");
+    $("span", pill).textContent = "连接中断";
+  } else if (status?.active_job || status?.operation || state.pendingAction) {
+    pill.classList.add("starting");
+    $("span", pill).textContent = ({restore: "恢复中", backup: "备份中", starting: "启动中", stopping: "停服中", restarting: "重启中", start: "启动中", stop: "停服中", restart: "重启中"})[status.active_job?.type || status.operation || state.pendingAction] || "处理中";
+  } else if (status?.port_conflict) {
+    pill.classList.add("error");
+    $("span", pill).textContent = "端口冲突";
+  } else if (status?.ready) {
     pill.classList.add("online");
     $("span", pill).textContent = "运行中";
-  } else if (status?.startup_failure) {
-    pill.classList.add("error");
-    $("span", pill).textContent = "启动失败";
   } else if (status?.running) {
     pill.classList.add("starting");
     $("span", pill).textContent = "正在加载";
+  } else if (status?.startup_failure) {
+    pill.classList.add("error");
+    $("span", pill).textContent = "启动失败";
   } else {
     pill.classList.add("offline");
     $("span", pill).textContent = "已停止";
@@ -290,23 +392,25 @@ function setStatusPill(status) {
 function updateStatusUI(status) {
   const server = activeServer();
   if (!server) return;
+  const failedAfterExit = Boolean(status.startup_failure && !status.running);
   $("#server-title").textContent = server.name;
   $("#server-path").textContent = server.path;
+  $("#server-path").title = server.path;
   setStatusPill(status);
-  $("#start-button").textContent = status.startup_failure ? "结束失败进程" : status.running ? "重新启动" : "启动服务端";
-  $("#start-button").dataset.action = status.startup_failure ? "force_stop" : status.running ? "restart" : "start";
+  $("#start-button").textContent = status.running ? "重新启动" : "一键开服";
+  $("#start-button").dataset.action = status.running ? "restart" : "start";
   $("#stop-button").disabled = !status.running;
   const heroStart = $(".hero-actions .button.primary");
   if (heroStart) {
-    heroStart.dataset.action = status.startup_failure ? "force_stop" : status.running ? "stop" : "start";
-    heroStart.textContent = status.startup_failure ? "结束失败进程" : status.running ? "正常停服" : "启动";
+    heroStart.dataset.action = status.running ? "stop" : "start";
+    heroStart.textContent = status.running ? "正常停服" : failedAfterExit ? "重试一键开服" : "一键开服";
   }
 
-  $("#hero-title").textContent = status.ready ? "服务器正在运行。" : status.startup_failure ? "服务器启动失败。" : status.running ? "服务器正在启动。" : "服务器当前已停止。";
+  $("#hero-title").textContent = status.ready ? "服务器正在运行。" : status.running ? "服务器正在启动。" : status.startup_failure ? "服务器启动失败。" : "服务器当前已停止。";
   $("#hero-subtitle").textContent = status.ready
-    ? `${status.motd || "Minecraft Server"} · ${status.managed ? "由面板托管" : "已接管外部控制台"}`
-    : status.startup_failure ? `${status.startup_failure.title} · ${status.startup_failure.detail}`
-      : status.running ? "Java 进程已启动，等待 Minecraft 状态端口就绪。" : "可以调整启动配置、管理 Mod 或创建离线备份。";
+    ? `${status.motd || "Minecraft Server"} · ${status.managed ? "由面板托管" : "已验证进程归属"}`
+    : status.running ? "Java 进程已启动，等待 Minecraft 状态端口就绪。"
+      : status.startup_failure ? `${status.startup_failure.title} · ${status.startup_failure.detail}` : "可以调整启动配置、管理 Mod 或创建离线备份。";
 
   $("#metric-players").textContent = `${status.players?.online ?? 0} / ${status.players?.max ?? "—"}`;
   $("#metric-player-names").textContent = status.players?.names?.length ? status.players.names.join("、") : "暂无在线玩家";
@@ -334,7 +438,40 @@ function updateStatusUI(status) {
   $("#detail-memory").textContent = `${server.xms} – ${server.xmx}`;
   $("#detail-external").textContent = server.external_address || "未设置";
   $("#detail-frp").textContent = status.frp_running ? "frpc 正在运行" : "未发现 frpc";
-  $("#detail-online-mode").textContent = status.online_mode === false ? "已关闭" : "读取配置中";
+  $("#detail-online-mode").textContent = status.online_mode === true ? "已开启" : status.online_mode === false ? "已关闭" : "未知";
+
+  const notice = $("#status-notice");
+  const failedJob = status.last_job?.state === "error" ? status.last_job : null;
+  const warning = status.port_conflict?.message || status.startup_failure?.detail || failedJob?.message;
+  notice.classList.toggle("hidden", !warning);
+  $("#notice-title").textContent = status.port_conflict ? "端口归属需要确认" : status.startup_failure?.title || (failedJob ? "维护任务需要处理" : "需要处理");
+  $("#notice-detail").textContent = warning || "";
+  const noticeAction = $("[data-view-jump]", notice);
+  const showBackupJob = failedJob && !status.port_conflict && !status.startup_failure;
+  noticeAction.dataset.viewJump = showBackupJob ? "backups" : "diagnostics";
+  noticeAction.textContent = showBackupJob ? "查看备份任务 ↗" : "查看诊断 ↗";
+  if (status.port_conflict) {
+    $("#hero-title").textContent = "启动前，还差一步。";
+    $("#hero-subtitle").textContent = `端口 ${status.port} 已被占用。为保护其他实例，面板不会自动接管。`;
+  }
+  const job = status.active_job;
+  const startupJob = job && ["start", "archive_import", "ftb_import"].includes(job.type);
+  $("#startup-task").classList.toggle("hidden", !startupJob);
+  if (startupJob) {
+    $("#startup-task-title").textContent = job.phase === "loading" ? "核心就绪 · 正在加载游戏服" : "一键开服 · 正在准备环境";
+    $("#startup-task-detail").textContent = job.message || "任务正在进行…";
+    $("#cancel-start").disabled = Boolean(job.cancel_requested);
+  }
+  if (job || status.operation || state.pendingAction) {
+    const labels = {restore: "正在恢复世界。", backup: "正在保护你的世界。", stopping: "正在保存并停服。", restarting: "正在重启服务端。", stop: "正在保存并停服。", restart: "正在重启服务端。", start: "正在一键开服。", archive_import: "正在一键开服。", ftb_import: "正在一键开服。"};
+    $("#hero-title").textContent = labels[job?.type || status.operation || state.pendingAction] || $("#hero-title").textContent;
+    $("#hero-subtitle").textContent = job?.message || "操作正在进行，请等待完成。其他维护操作暂时锁定。";
+  }
+  $("#hero-state-label").textContent = $("#status-pill span").textContent;
+  $("#hero-card").dataset.state = status.port_conflict || status.startup_failure ? "error" : status.ready ? "online" : "offline";
+  $("#connection-banner").classList.add("hidden");
+  $("#sync-time").textContent = `更新于 ${new Date(state.lastUpdated || Date.now()).toLocaleTimeString("zh-CN", {hour12: false})}`;
+  $("#copy-address").disabled = !server.external_address;
 
   const eulaBox = $("#eula-box");
   if (eulaBox) {
@@ -343,16 +480,67 @@ function updateStatusUI(status) {
     $("#accept-eula").classList.toggle("hidden", Boolean(status.eula));
   }
   renderServerList();
+  syncActionButtons();
+}
+
+async function refreshOverview() {
+  if (!state.activeId || state.view !== "dashboard" || document.hidden) return;
+  const serverId = state.activeId;
+  try {
+    const [backups, logs] = await Promise.all([
+      api(`/api/backups?server_id=${encodeURIComponent(serverId)}`),
+      api(`/api/logs?server_id=${encodeURIComponent(serverId)}`),
+    ]);
+    if (serverId !== state.activeId) return;
+    const latest = (backups.data || []).find((backup) => backup.verified);
+    $("#overview-backup-title").textContent = latest ? "世界，已有一份安心。" : "为世界留一个还原点。";
+    $("#overview-backup-time").textContent = latest ? formatDate(latest.modified) : "尚无已验证备份";
+    $("#overview-backup-meta").textContent = latest ? `${Number(latest.size_mb).toFixed(1)} MB · ${Number(latest.file_count).toLocaleString()} 个文件` : "完整性校验 · 恢复前保留原文件";
+    $("#overview-backup-state").textContent = latest ? "已完成" : "建议备份";
+    $("#overview-backup-state").classList.toggle("pending", !latest);
+    $("#overview-log").textContent = (logs.data?.text || "").trim().split(/\r?\n/).slice(-6).join("\n") || "还没有运行日志。启动服务器后，这里会显示最新动态。";
+  } catch {
+    if (serverId !== state.activeId) return;
+    $("#overview-backup-time").textContent = "暂时无法读取备份";
+    $("#overview-log").textContent = "暂时无法读取日志，请检查面板连接。";
+  }
+}
+
+function decorateNavigation() {
+  const paths = {
+    dashboard: 'M3 10 12 3l9 7M5 9v11h5v-6h4v6h5V9',
+    performance: 'M3 19V5m0 14h18M6 14l4-5 4 3 6-8',
+    console: 'm5 7 5 5-5 5m8 0h6',
+    mods: 'm12 3 9 5v9l-9 5-9-5V8l9-5Zm0 9v10M3 8l9 5 9-5',
+    files: 'M3 7V5h7l2 3h9v12H3V7Z',
+    settings: 'M4 7h16M4 17h16M9 4v6m6 4v6',
+    players: 'M16 21v-2a5 5 0 0 0-10 0v2m14 0v-2a5 5 0 0 0-3-4M14 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm3-3a4 4 0 0 1 0 7',
+    rules: 'M4 4v17M4 5c5-5 10 5 16 0v9c-6 5-11-5-16 0',
+    backups: 'M12 3 3 7v6c0 4 5 7 9 9 4-2 9-5 9-9V7l-9-4Zm-5 9 3 3 6-6',
+    automation: 'm13 2-9 12h7l-1 8 10-13h-7l0-7Z',
+    diagnostics: 'M2 12h5l3-8 4 16 3-8h5',
+    about: 'M12 16v-4m0-4v.01M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z',
+  };
+  $$(".nav-item").forEach((button) => {
+    const target = $("span", button);
+    if (target) target.innerHTML = `<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[button.dataset.view] || paths.about}"/></svg>`;
+  });
 }
 
 function renderMetricBars(container, points, key, maxValue, formatter) {
   const recent = points.slice(-72);
   const maximum = Math.max(1, Number(maxValue || 0), ...recent.map((point) => Number(point[key] || 0)));
-  container.innerHTML = recent.map((point) => {
+  const bars = recent.map((point) => {
     const value = Number(point[key] || 0);
     const height = point.running ? Math.max(3, Math.min(100, value / maximum * 100)) : 1;
-    return `<i class="${point.running ? "" : "offline"}" style="height:${height.toFixed(2)}%" title="${escapeHtml(formatDate(point.at))} · ${escapeHtml(formatter(value))}"></i>`;
-  }).join("");
+    const bar = document.createElement("i");
+    bar.className = point.running ? "" : "offline";
+    // Property assignment is permitted by our CSP; HTML style attributes are not.
+    bar.style.height = `${height.toFixed(2)}%`;
+    bar.title = `${formatDate(point.at)} · ${formatter(value)}`;
+    return bar;
+  });
+  container.replaceChildren(...bars);
 }
 
 async function refreshPerformance(sample = true) {
@@ -383,24 +571,53 @@ async function refreshPerformance(sample = true) {
 
 async function refreshStatus(showError = false) {
   if (!state.activeId || document.hidden) return;
+  const serverId = state.activeId;
+  const request = ++state.statusRequest;
   try {
-    const payload = await api(`/api/status?server_id=${encodeURIComponent(state.activeId)}`);
+    const payload = await api(`/api/status?server_id=${encodeURIComponent(serverId)}`);
+    if (request !== state.statusRequest || serverId !== state.activeId) return;
     state.status = payload.data;
-    const config = await api(`/api/config?server_id=${encodeURIComponent(state.activeId)}`);
-    state.status.online_mode = config.data["online-mode"] === "true";
+    state.connected = true;
+    state.lastUpdated = Date.now();
+    document.body.classList.remove("disconnected");
     updateStatusUI(state.status);
   } catch (error) {
+    if (request !== state.statusRequest || serverId !== state.activeId) return;
+    markDisconnected();
     if (showError) toast(error.message, "error");
   }
 }
 
+function markDisconnected() {
+  state.connected = false;
+  setStatusPill(state.status);
+  document.body.classList.add("disconnected");
+  $("#connection-banner").classList.remove("hidden");
+  $("#hero-title").textContent = "与面板的连接已中断。";
+  $("#hero-subtitle").textContent = state.activeId
+    ? "暂时无法确认服务器状态。请检查面板启动窗口；连接恢复后会自动刷新。"
+    : "尚未取得实例信息。请检查面板启动窗口后，点击重新连接。";
+  $("#sync-time").textContent = state.lastUpdated ? `最后更新 ${new Date(state.lastUpdated).toLocaleTimeString("zh-CN", {hour12:false})}` : "尚未取得状态";
+  if (!state.activeId) $("#server-path").textContent = "尚未读取实例配置";
+  syncActionButtons();
+}
+
+async function reconnectPanel() {
+  if (state.activeId) return refreshStatus(true);
+  try { await bootstrap(); }
+  catch (error) { markDisconnected(); toast(error.message, "error"); }
+}
+
 async function runAction(action, sourceButton = null) {
+  if (state.pendingAction || state.switching) return;
   if (!state.activeId) return openImportModal();
   if (action === "restart" && !window.confirm("确定正常保存并重启服务端吗？")) return;
   if (action === "stop" && !window.confirm("确定正常保存并停止服务端吗？")) return;
   if (action === "force_stop" && sourceButton?.id !== "force-stop" && !window.confirm("服务端已确认启动失败。确定结束残留 Java 进程吗？")) return;
   const button = sourceButton || $(`[data-action="${action}"]`);
+  state.pendingAction = action;
   setBusy(button, true, action === "start" ? "正在启动…" : action === "stop" ? "正在停服…" : "处理中…");
+  if (state.status) updateStatusUI(state.status);
   try {
     const payload = await api("/api/action", { method: "POST", body: { server_id: state.activeId, action } });
     toast(payload.message);
@@ -409,7 +626,9 @@ async function runAction(action, sourceButton = null) {
     toast(error.message, "error", 6500);
     if (error.message.includes("EULA")) showView("settings");
   } finally {
+    state.pendingAction = null;
     setBusy(button, false);
+    if (state.status) updateStatusUI(state.status);
   }
 }
 
@@ -618,7 +837,9 @@ function joinServerPath(folder, name) {
 async function refreshFiles(path = "") {
   if (!state.activeId || document.hidden) return;
   try {
+    const serverId = state.activeId;
     const payload = await api(`/api/files?server_id=${encodeURIComponent(state.activeId)}&path=${encodeURIComponent(path)}`);
+    if (serverId !== state.activeId) return;
     state.filePath = payload.data.path || "";
     state.files = payload.data.entries || [];
     renderFiles(payload.data.parent || "");
@@ -643,21 +864,32 @@ function renderFiles(parent) {
 }
 
 async function openTextFile(path) {
-  const payload = await api(`/api/file/content?server_id=${encodeURIComponent(state.activeId)}&path=${encodeURIComponent(path)}`);
-  state.editingFile = payload.data.path;
-  $("#file-editor-title").textContent = payload.data.path;
+  if (!confirmDiscardEditor()) return;
+  const serverId = state.activeId;
+  const request = ++state.editorRequest;
+  const payload = await api(`/api/file/content?server_id=${encodeURIComponent(serverId)}&path=${encodeURIComponent(path)}`);
+  if (serverId !== state.activeId || request !== state.editorRequest) return;
+  state.editingFile = {serverId, path: payload.data.path, original: payload.data.content, revision: payload.data.revision};
+  $("#file-editor-title").textContent = `${activeServer()?.name || serverId} / ${payload.data.path}`;
   $("#file-editor-content").value = payload.data.content;
+  state.editingFile.original = $("#file-editor-content").value;
   $("#file-editor").classList.remove("hidden");
   $("#file-editor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function saveTextFile() {
-  if (!state.editingFile) return;
+  const editing = state.editingFile;
+  if (!editing || editing.serverId !== state.activeId || state.switching) return;
+  const content = $("#file-editor-content").value;
   const button = $("#file-editor-save");
   setBusy(button, true, "保存中…");
   try {
-    const payload = await api("/api/file/save", { method: "POST", body: { server_id: state.activeId, path: state.editingFile, content: $("#file-editor-content").value } });
+    const payload = await api("/api/file/save", { method: "POST", body: { server_id: editing.serverId, path: editing.path, content, revision: editing.revision } });
     toast(payload.message);
+    if (state.editingFile !== editing || state.activeId !== editing.serverId) return;
+    editing.original = content;
+    // The backend preserves CRLF / BOM, so use its exact saved-byte revision.
+    editing.revision = payload.revision;
     await refreshFiles(state.filePath);
   } catch (error) { toast(error.message, "error", 6500); }
   finally { setBusy(button, false); }
@@ -715,6 +947,7 @@ function fillProperties(config) {
 function fillLaunchProfile(server) {
   if (!server) return;
   const form = $("#launch-form");
+  if (form.elements.auto_setup) form.elements.auto_setup.checked = server.auto_setup !== false;
   for (const key of ["name", "java", "xms", "xmx", "launch_mode", "external_address", "auto_backup_keep"]) {
     if (form.elements.namedItem(key)) form.elements.namedItem(key).value = server[key] ?? "";
   }
@@ -761,6 +994,7 @@ async function saveLaunch(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const profile = Object.fromEntries(new FormData(form).entries());
+  profile.auto_setup = form.elements.auto_setup.checked;
   profile.auto_backup_keep = Number(profile.auto_backup_keep);
   const button = $("button[type='submit']", form);
   setBusy(button, true);
@@ -834,7 +1068,7 @@ async function refreshBackups() {
   try {
     const payload = await api(`/api/backups?server_id=${encodeURIComponent(state.activeId)}`);
     const tbody = $("#backup-table");
-    tbody.innerHTML = (payload.data || []).map((backup) => `<tr data-name="${escapeHtml(backup.name)}"><td><div class="mod-name"><span class="mod-gem">◴</span><span><strong>${escapeHtml(backup.name)}</strong><small>世界与关键配置</small></span></div></td><td>${escapeHtml(formatDate(backup.modified))}</td><td>${Number(backup.size_mb).toFixed(2)} MB</td><td><div class="row-actions"><a class="row-button" href="/api/backup/download?server_id=${encodeURIComponent(state.activeId)}&name=${encodeURIComponent(backup.name)}">下载</a><button class="row-button" data-backup-restore>恢复</button><button class="row-button danger" data-backup-remove>移除</button></div></td></tr>`).join("");
+    tbody.innerHTML = (payload.data || []).map((backup) => `<tr data-name="${escapeHtml(backup.name)}"><td><div class="mod-name"><span class="mod-gem">◴</span><span><strong>${escapeHtml(backup.name)}</strong><small>${backup.verified ? `已完成 · ${Number(backup.file_count)} 个文件 · ${escapeHtml((backup.worlds || []).join(" / "))}` : "旧备份 · 未验证，仅供下载核验"}</small></span></div></td><td>${escapeHtml(formatDate(backup.modified))}</td><td>${Number(backup.size_mb).toFixed(2)} MB</td><td><div class="row-actions"><a class="row-button" href="/api/backup/download?server_id=${encodeURIComponent(state.activeId)}&name=${encodeURIComponent(backup.name)}">下载</a><button class="row-button" data-backup-restore ${!backup.verified || state.status?.running || state.status?.active_job ? "disabled" : ""}>恢复</button><button class="row-button danger" data-backup-remove>移除</button></div></td></tr>`).join("");
     $("#backup-empty").classList.toggle("hidden", payload.data.length !== 0);
   } catch (error) { toast(error.message, "error"); }
 }
@@ -846,6 +1080,7 @@ async function createBackup() {
     const payload = await api("/api/backups", { method: "POST", body: { server_id: state.activeId, action: "create" } });
     toast(payload.message);
     $("#backup-job").classList.remove("hidden");
+    await refreshStatus();
     await refreshJobs();
   } catch (error) { toast(error.message, "error"); }
   finally { setBusy(button, false); }
@@ -872,6 +1107,7 @@ async function restoreBackup(button) {
     const payload = await api("/api/backups", { method: "POST", body: { server_id: state.activeId, action: "restore", name } });
     toast(payload.message);
     $("#backup-job").classList.remove("hidden");
+    await refreshStatus();
     await refreshJobs();
   } catch (error) { toast(error.message, "error", 6500); }
   finally { setBusy(button, false); }
@@ -908,7 +1144,13 @@ function switchImportSource(source) {
     });
   });
   const submit = $("#import-submit");
-  if (!state.importJobId) submit.textContent = source === "folder" ? "检测并导入" : state.importInspection ? "导入并开服" : "检查压缩包";
+  if (!state.importJobId) submit.textContent = source === "ftb" ? "下载并一键开服" : source === "folder" ? "导入并一键开服" : state.importInspection ? "一键开服" : "检查压缩包";
+  const form = $("#import-form");
+  if (form.elements?.accept_eula) {
+    form.elements.accept_eula.required = source === "archive" && Boolean(state.importInspection);
+    form.elements.trust_pack.required = source === "archive" && Boolean(state.importInspection);
+  }
+  if (source === "archive") updateQuickSetup();
 }
 
 function formatFileSize(bytes) {
@@ -927,6 +1169,11 @@ function renderArchiveInspection(data) {
     <article><span>解压体积</span><strong>${escapeHtml(formatFileSize(data.expanded_size))}</strong></article>
     <article><span>文件数量</span><strong>${Number(data.file_count || 0).toLocaleString("zh-CN")}</strong></article>`;
   const form = $("#import-form");
+  $("#archive-plan").textContent = data.bootstrap?.supported
+    ? `自动准备 ${data.loader} / Java ${data.bootstrap.java_major} → 加载模组 → 确认游戏服务就绪。首次需要联网，已完成的依赖会复用。`
+    : (data.bootstrap?.reason || "保留原有启动方式；请确认 Java 与作者脚本要求。");
+  form.elements.accept_eula.required = true;
+  form.elements.trust_pack.required = true;
   form.elements.archive_name.value = data.name || "Minecraft Server";
   form.elements.destination.value = data.destination || "";
   const javaSelect = $("#archive-java");
@@ -940,6 +1187,17 @@ function renderArchiveInspection(data) {
   }).join("");
   $("#archive-review").classList.remove("hidden");
   $("#import-submit").textContent = "导入并开服";
+  updateQuickSetup();
+}
+
+function updateQuickSetup() {
+  const form = $("#import-form");
+  const quick = form.elements.setup_mode.value !== "custom";
+  for (const id of ["#archive-java", "#archive-launch"]) {
+    const control = $(id);
+    control.disabled = state.importSource !== "archive" || quick || Boolean(state.importJobId);
+    control.closest("label").classList.toggle("hidden", quick);
+  }
 }
 
 async function inspectArchive() {
@@ -955,12 +1213,13 @@ function updateImportProgress(job) {
   $("#import-progress-label").textContent = job.message || "正在导入…";
   $("#import-progress-value").textContent = `${progress}%`;
   $("#import-progress-bar").style.width = `${progress}%`;
+  $("#cancel-import").disabled = !["queued", "running"].includes(job.state) || Boolean(job.cancel_requested);
 }
 
 async function waitForImport(jobId) {
   for (;;) {
     await new Promise((resolve) => window.setTimeout(resolve, 900));
-    const payload = await api("/api/jobs");
+    const payload = await api(`/api/jobs?id=${encodeURIComponent(jobId)}`);
     const job = (payload.data || []).find((item) => item.id === jobId);
     if (!job) throw new Error("面板没有找到导入任务");
     updateImportProgress(job);
@@ -987,6 +1246,8 @@ async function importArchive() {
     launch_target: targetParts.join("|"),
     accept_eula: form.elements.accept_eula.checked,
     start_after_import: form.elements.start_after_import.checked,
+    trust_pack: form.elements.trust_pack.checked,
+    auto_setup: form.elements.setup_mode.value !== "custom" || launchMode === "auto",
     properties: {
       "server-port": Number(form.elements.server_port.value),
       "max-players": Number(form.elements.max_players.value),
@@ -1013,7 +1274,22 @@ async function importServer(event) {
   const button = $("button[type='submit']", event.currentTarget);
   setBusy(button, true, state.importSource === "archive" && state.importInspection ? "正在导入…" : "正在检测…");
   try {
-    if (state.importSource === "archive") {
+    if (state.importSource === "ftb") {
+      const form = event.currentTarget;
+      const payload = await api("/api/import/ftb", {method: "POST", body: {
+        pack_id: Number(form.elements.ftb_pack.value), version_id: form.elements.ftb_version.value.trim(),
+        destination: form.elements.ftb_destination.value.trim(), xms: "1G", xmx: form.elements.ftb_xmx.value.trim(),
+        accept_eula: form.elements.ftb_eula.checked, trust_pack: form.elements.ftb_trust.checked,
+        properties: {"server-port": Number(form.elements.ftb_port.value), "online-mode": true},
+      }});
+      state.importJobId = payload.job.id;
+      updateImportProgress(payload.job);
+      switchImportSource("ftb");
+      const job = await waitForImport(payload.job.id);
+      await bootstrap(job.server_id);
+      toast(job.message);
+      closeImportModal();
+    } else if (state.importSource === "archive") {
       const job = await importArchive();
       if (!job) return;
       toast(job.message || "服务端已导入");
@@ -1027,18 +1303,35 @@ async function importServer(event) {
         java: form.elements.java.value,
         xms: form.elements.xms.value,
         xmx: form.elements.xmx.value,
+        auto_setup: true, start_after_import: form.elements.folder_start.checked,
+        accept_eula: form.elements.folder_eula.checked, trust_pack: form.elements.folder_trust.checked,
       };
       const payload = await api("/api/servers/import", { method: "POST", body: data });
+      if (payload.job) {
+        state.importJobId = payload.job.id;
+        updateImportProgress(payload.job);
+        switchImportSource("folder");
+        await waitForImport(payload.job.id);
+      }
       toast(payload.message);
       closeImportModal();
       await bootstrap(payload.profile.id);
     }
-  } catch (error) { toast(error.message, "error", 6500); }
+  } catch (error) { toast(error.message, "error", 6500); if (state.importJobId) await bootstrap(); }
   finally {
     state.importJobId = null;
+    $("#cancel-import").disabled = true;
     setBusy(button, false);
     switchImportSource(state.importSource);
   }
+}
+
+async function cancelStartup(jobId) {
+  if (!jobId) return;
+  try {
+    const payload = await api("/api/start/cancel", {method: "POST", body: {job_id: jobId}});
+    toast(payload.message);
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function pickArchive() {
@@ -1188,6 +1481,9 @@ function bindEvents() {
   $$('[data-modal-close]').forEach((button) => button.addEventListener("click", closeImportModal));
   $("#import-modal").addEventListener("click", (event) => { if (event.target === event.currentTarget) closeImportModal(); });
   $("#import-form").addEventListener("submit", importServer);
+  $("#cancel-import").addEventListener("click", () => cancelStartup(state.importJobId));
+  $("#cancel-start").addEventListener("click", () => cancelStartup(state.status?.active_job?.id));
+  $$('input[name="setup_mode"]').forEach(control => control.addEventListener("change", updateQuickSetup));
   $$("[data-import-source]").forEach((button) => button.addEventListener("click", () => switchImportSource(button.dataset.importSource)));
   $("#pick-archive").addEventListener("click", pickArchive);
   $("#archive-path").addEventListener("input", () => {
@@ -1275,7 +1571,7 @@ function bindEvents() {
     } catch (error) { toast(error.message, "error", 6500); }
   });
   $("#file-editor-save").addEventListener("click", saveTextFile);
-  $("#file-editor-close").addEventListener("click", () => { state.editingFile = null; $("#file-editor").classList.add("hidden"); });
+  $("#file-editor-close").addEventListener("click", () => { if (confirmDiscardEditor()) resetFileEditor(); });
   $("#properties-form").addEventListener("submit", saveProperties);
   $("#launch-form").addEventListener("submit", saveLaunch);
   $("#accept-eula").addEventListener("click", acceptEula);
@@ -1283,6 +1579,15 @@ function bindEvents() {
   $("#remove-server").addEventListener("click", removeServer);
   $("#player-form").addEventListener("submit", submitPlayerAction);
   $("#backup-create").addEventListener("click", createBackup);
+  $("#overview-backup").addEventListener("click", () => { showView("backups"); createBackup(); });
+  $("#connection-retry").addEventListener("click", reconnectPanel);
+  $("#copy-address").addEventListener("click", async () => {
+    const address = activeServer()?.external_address;
+    if (!address) return;
+    try { await navigator.clipboard.writeText(address); toast("连接地址已复制"); }
+    catch { toast("复制失败，请从服务器信息中手动复制", "error"); }
+  });
+  window.addEventListener("beforeunload", (event) => { if (editorIsDirty()) { event.preventDefault(); event.returnValue = ""; } });
   $("#automation-save").addEventListener("click", saveAutomation);
   $("#diagnostic-refresh").addEventListener("click", refreshDiagnostics);
   $("#diagnostic-copy").addEventListener("click", copyDiagnosticSummary);
@@ -1302,17 +1607,23 @@ function bindEvents() {
 
 async function initialize() {
   initializeTheme();
+  decorateNavigation();
+  syncNavigationAccessibility();
+  window.addEventListener("resize", syncNavigationAccessibility);
   bindEvents();
   renderCommandLibrary();
+  syncActionButtons();
   try {
     await bootstrap();
   } catch (error) {
+    markDisconnected();
     toast(error.message, "error", 8000);
   }
   state.timers.push(window.setInterval(() => refreshStatus(), 5000));
   state.timers.push(window.setInterval(() => refreshLogs(), 2200));
   state.timers.push(window.setInterval(() => refreshJobs(), 2800));
   state.timers.push(window.setInterval(() => { if (state.view === "performance") refreshPerformance(false); }, 5000));
+  state.timers.push(window.setInterval(() => { if (state.view === "dashboard") refreshOverview(); }, 10000));
 }
 
 initialize();
